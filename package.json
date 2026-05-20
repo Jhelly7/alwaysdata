@@ -1,0 +1,22 @@
+{
+  "name": "polygon-microservice",
+  "version": "2.0.0",
+  "description": "Polygon HD wallet derivation + on-chain USDT payment verification microservice for AlwaysData",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev":   "node --watch src/server.js"
+  },
+  "dependencies": {
+    "bip32":                  "^4.0.0",
+    "bip39":                  "^3.1.0",
+    "ethereum-cryptography":  "^2.2.1",
+    "express":                "^4.19.2",
+    "qrcode":                 "^1.5.4",
+    "tiny-secp256k1":         "^2.2.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
