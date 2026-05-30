@@ -49,7 +49,17 @@ app.use((req, res, next) => {
 });
 
 const toPolygon    = createProxyMiddleware({ target: 'http://localhost:8100', changeOrigin: false });
-const toDispatcher = createProxyMiddleware({ target: 'http://localhost:3002', changeOrigin: false });
+const toDispatcher = createProxyMiddleware({
+  target: 'http://localhost:3002',
+  changeOrigin: false,
+  on: {
+    proxyRes: (proxyRes) => {
+      proxyRes.headers['access-control-allow-origin'] = '*';
+      proxyRes.headers['access-control-allow-methods'] = 'GET, POST, DELETE, OPTIONS';
+      proxyRes.headers['access-control-allow-headers'] = 'Content-Type, x-api-key';
+    },
+  },
+});
 const toProxy      = createProxyMiddleware({ target: 'http://localhost:8080', changeOrigin: false });
 
 // /health agregado — responde com dados dos 3 serviços
