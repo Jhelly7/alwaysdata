@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: unified-service
+    name: alwaysdata
     runtime: docker
     region: oregon
     plan: free
@@ -52,5 +52,5 @@ services:
       - key: RENDER_EXTERNAL_URL
         fromService:
           type: web
-          name: unified-service
+          name: alwaysdata
           property: host
