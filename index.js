@@ -7,12 +7,10 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const RENDER_PORT = process.env.PORT || '10000';
 
-// Captura erros de porta em uso a nível global — evita crash do processo inteiro
-// quando o Render reinicia e a porta anterior ainda não foi libertada
+// Captura erros de porta em uso a nível global
 process.on('uncaughtException', (err) => {
   if (err.code === 'EADDRINUSE') {
     console.error(`[index] AVISO: porta já em uso — ${err.message}`);
-    // Não faz process.exit() — deixa os outros serviços continuarem
   } else {
     console.error('[index] Erro não capturado:', err);
     process.exit(1);
@@ -47,7 +45,23 @@ const toPolygon    = createProxyMiddleware({ target: 'http://localhost:8100', ch
 const toDispatcher = createProxyMiddleware({ target: 'http://localhost:3002', changeOrigin: false });
 const toProxy      = createProxyMiddleware({ target: 'http://localhost:8080', changeOrigin: false });
 
-app.use('/health',   toPolygon);
+// /health agregado — responde com dados dos 3 serviços
+app.get('/health', async (_req, res) => {
+  const [polygon, dispatcher] = await Promise.all([
+    fetch('http://localhost:8100/health').then(r => r.json()).catch(() => ({ ok: false })),
+    fetch('http://localhost:3002/health').then(r => r.json()).catch(() => ({ ok: false })),
+  ]);
+  res.json({
+    ok:          polygon.ok && dispatcher.ok,
+    accounts:    dispatcher.accounts    ?? 0,
+    active_jobs: dispatcher.active_jobs ?? 0,
+    workflow:    dispatcher.workflow    ?? null,
+    polygon:     polygon.ok,
+    network:     polygon.network        ?? null,
+    ts:          new Date().toISOString(),
+  });
+});
+
 app.use('/polygon',  toPolygon);
 app.use('/tron',     toPolygon);
 app.use('/dispatch', toDispatcher);
@@ -58,7 +72,8 @@ app.use('/',         toProxy);
 
 app.listen(RENDER_PORT, '0.0.0.0', () => {
   console.log(`[index] router na porta ${RENDER_PORT}`);
-  console.log('  /polygon/* /tron/* /health → :8100');
+  console.log('  /health          → agregado (polygon + dispatcher)');
+  console.log('  /polygon/* /tron/* → :8100');
   console.log('  /dispatch /webhook /jobs/* /status → :3002');
   console.log('  /* → :8080 (proxy + cloudflared)');
 });
