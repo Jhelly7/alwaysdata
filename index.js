@@ -1,6 +1,5 @@
 // index.js — arranca os 3 serviços na mesma instância Render
 // Nenhum ficheiro original é alterado.
-
 import { spawn } from 'child_process';
 import express from 'express';
 import { createProxyMiddleware } from 'http-proxy-middleware';
@@ -38,8 +37,16 @@ proxyProc.on('exit', (code) => {
 
 // ── 4. Router na porta pública do Render ─────────────────────────────────────
 process.env.PORT = RENDER_PORT;
-
 const app = express();
+
+// ── CORS — aceita qualquer origem ────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 const toPolygon    = createProxyMiddleware({ target: 'http://localhost:8100', changeOrigin: false });
 const toDispatcher = createProxyMiddleware({ target: 'http://localhost:3002', changeOrigin: false });
