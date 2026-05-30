@@ -2,7 +2,10 @@ import { spawn } from 'child_process';
 import express from 'express';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 
+// Guardar e limpar o PORT do Render ANTES de qualquer import
+// Assim nenhum serviço consegue escutar na porta pública acidentalmente
 const RENDER_PORT = process.env.PORT || '10000';
+delete process.env.PORT;
 
 process.on('uncaughtException', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -39,7 +42,6 @@ const CORS_ORIGINS = [
   'https://digital.pixgo.frii.site',
 ];
 
-// Garante que headers CORS passam através do proxy
 function ensureCors(proxyRes, req) {
   const origin = req.headers.origin || '';
   if (CORS_ORIGINS.includes(origin)) {
@@ -49,25 +51,10 @@ function ensureCors(proxyRes, req) {
   }
 }
 
-const toPolygon = createProxyMiddleware({
-  target: 'http://localhost:8100',
-  changeOrigin: false,
-  on: { proxyRes: ensureCors },
-});
+const toPolygon    = createProxyMiddleware({ target: 'http://localhost:8100', changeOrigin: false, on: { proxyRes: ensureCors } });
+const toDispatcher = createProxyMiddleware({ target: 'http://localhost:3002', changeOrigin: false, on: { proxyRes: ensureCors } });
+const toProxy      = createProxyMiddleware({ target: 'http://localhost:8080', changeOrigin: false, on: { proxyRes: ensureCors } });
 
-const toDispatcher = createProxyMiddleware({
-  target: 'http://localhost:3002',
-  changeOrigin: false,
-  on: { proxyRes: ensureCors },
-});
-
-const toProxy = createProxyMiddleware({
-  target: 'http://localhost:8080',
-  changeOrigin: false,
-  on: { proxyRes: ensureCors },
-});
-
-// /health → dispatcher com CORS
 app.options('/health', (req, res) => {
   const origin = req.headers.origin || '';
   if (CORS_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
