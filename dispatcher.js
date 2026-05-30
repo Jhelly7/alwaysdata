@@ -25,9 +25,17 @@ import express from 'express';
 const app  = express();
 app.use(express.json({ limit: '1mb' }));
 
-// ── CORS — aceita qualquer origem ────────────────────────────────────────────
+// ── CORS — permite chamadas do painel admin (pages.dev e domínio próprio) ────
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const allowed = [
+    'https://streamvault-admin.pages.dev',
+    'https://pixgo.qzz.io',
+    'https://digital.pixgo.frii.site',
+  ];
+  const origin = req.headers.origin || '';
+  if (allowed.includes(origin) || !origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
