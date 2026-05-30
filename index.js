@@ -48,19 +48,15 @@ app.use((req, res, next) => {
   next();
 });
 
-const toPolygon    = createProxyMiddleware({ target: 'http://localhost:8100', changeOrigin: false });
-const toDispatcher = createProxyMiddleware({
-  target: 'http://localhost:3002',
-  changeOrigin: false,
-  on: {
-    proxyRes: (proxyRes) => {
-      proxyRes.headers['access-control-allow-origin'] = '*';
-      proxyRes.headers['access-control-allow-methods'] = 'GET, POST, DELETE, OPTIONS';
-      proxyRes.headers['access-control-allow-headers'] = 'Content-Type, x-api-key';
-    },
-  },
-});
-const toProxy      = createProxyMiddleware({ target: 'http://localhost:8080', changeOrigin: false });
+function corsHeaders(proxyRes) {
+  proxyRes.headers['access-control-allow-origin']  = '*';
+  proxyRes.headers['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
+  proxyRes.headers['access-control-allow-headers'] = 'Content-Type, Authorization, x-api-key';
+}
+
+const toPolygon    = createProxyMiddleware({ target: 'http://localhost:8100', changeOrigin: false, on: { proxyRes: corsHeaders } });
+const toDispatcher = createProxyMiddleware({ target: 'http://localhost:3002', changeOrigin: false, on: { proxyRes: corsHeaders } });
+const toProxy      = createProxyMiddleware({ target: 'http://localhost:8080', changeOrigin: false, on: { proxyRes: corsHeaders } });
 
 // /health agregado — responde com dados dos 3 serviços
 app.get('/health', async (_req, res) => {
