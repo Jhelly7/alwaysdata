@@ -33,25 +33,54 @@ process.env.PORT = RENDER_PORT;
 
 const app = express();
 
-const toPolygon    = createProxyMiddleware({ target: 'http://localhost:8100', changeOrigin: false });
-const toDispatcher = createProxyMiddleware({ target: 'http://localhost:3002', changeOrigin: false });
-const toProxy      = createProxyMiddleware({ target: 'http://localhost:8080', changeOrigin: false });
+const CORS_ORIGINS = [
+  'https://streamvault-admin.pages.dev',
+  'https://pixgo.qzz.io',
+  'https://digital.pixgo.frii.site',
+];
 
-// /health → dispatcher (:3002) com CORS
-// O painel lê active_jobs e accounts que vêm do dispatcher/health
-const CORS_ORIGINS = ['https://streamvault-admin.pages.dev', 'https://pixgo.qzz.io'];
-
-function setCors(req, res) {
+// Garante que headers CORS passam através do proxy
+function ensureCors(proxyRes, req) {
   const origin = req.headers.origin || '';
-  if (CORS_ORIGINS.includes(origin) || !origin)
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  if (CORS_ORIGINS.includes(origin)) {
+    proxyRes.headers['access-control-allow-origin'] = origin;
+    proxyRes.headers['access-control-allow-methods'] = 'GET, POST, DELETE, OPTIONS';
+    proxyRes.headers['access-control-allow-headers'] = 'Content-Type, x-api-key, x-service-key';
+  }
 }
 
-app.options('/health', (req, res) => { setCors(req, res); res.sendStatus(204); });
+const toPolygon = createProxyMiddleware({
+  target: 'http://localhost:8100',
+  changeOrigin: false,
+  on: { proxyRes: ensureCors },
+});
+
+const toDispatcher = createProxyMiddleware({
+  target: 'http://localhost:3002',
+  changeOrigin: false,
+  on: { proxyRes: ensureCors },
+});
+
+const toProxy = createProxyMiddleware({
+  target: 'http://localhost:8080',
+  changeOrigin: false,
+  on: { proxyRes: ensureCors },
+});
+
+// /health → dispatcher com CORS
+app.options('/health', (req, res) => {
+  const origin = req.headers.origin || '';
+  if (CORS_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  res.sendStatus(204);
+});
+
 app.get('/health', async (req, res) => {
-  setCors(req, res);
+  const origin = req.headers.origin || '';
+  if (CORS_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
   try {
     const r = await fetch('http://localhost:3002/health');
     const d = await r.json();
