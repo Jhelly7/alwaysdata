@@ -1,40 +1,13 @@
-import { spawn } from 'child_process';
+// index.js — ponto de entrada único
+// Importa os 3 apps, monta-os num único Express na porta do Render.
+// Cada ficheiro exporta a sua app/server sem chamar .listen().
+
 import express from 'express';
-import { createProxyMiddleware } from 'http-proxy-middleware';
+import { app as polygonApp }    from './server.js';
+import { app as dispatcherApp } from './dispatcher.js';
+import { server as proxyServer } from './proxy.js';
 
-// Guardar e limpar o PORT do Render ANTES de qualquer import
-// Assim nenhum serviço consegue escutar na porta pública acidentalmente
-const RENDER_PORT = process.env.PORT || '10000';
-delete process.env.PORT;
-
-process.on('uncaughtException', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`[index] AVISO: porta já em uso — ${err.message}`);
-  } else {
-    console.error('[index] Erro não capturado:', err);
-    process.exit(1);
-  }
-});
-
-process.env.PORT = '8100';
-await import('./server.js');
-
-process.env.PORT = '3002';
-await import('./dispatcher.js');
-
-process.env.PORT = '8080';
-const proxyProc = spawn('sh', ['./start.sh'], {
-  env: { ...process.env },
-  stdio: 'inherit',
-});
-proxyProc.on('exit', (code) => {
-  console.error(`[index] start.sh saiu com código ${code}`);
-  process.exit(1);
-});
-
-process.env.PORT = RENDER_PORT;
-
-const app = express();
+const PORT = process.env.PORT || '10000';
 
 const CORS_ORIGINS = [
   'https://streamvault-admin.pages.dev',
@@ -42,20 +15,10 @@ const CORS_ORIGINS = [
   'https://digital.pixgo.frii.site',
 ];
 
-function ensureCors(proxyRes, req) {
-  const origin = req.headers.origin || '';
-  if (CORS_ORIGINS.includes(origin)) {
-    proxyRes.headers['access-control-allow-origin'] = origin;
-    proxyRes.headers['access-control-allow-methods'] = 'GET, POST, DELETE, OPTIONS';
-    proxyRes.headers['access-control-allow-headers'] = 'Content-Type, x-api-key, x-service-key';
-  }
-}
+const main = express();
 
-const toPolygon    = createProxyMiddleware({ target: 'http://localhost:8100', changeOrigin: false, on: { proxyRes: ensureCors } });
-const toDispatcher = createProxyMiddleware({ target: 'http://localhost:3002', changeOrigin: false, on: { proxyRes: ensureCors } });
-const toProxy      = createProxyMiddleware({ target: 'http://localhost:8080', changeOrigin: false, on: { proxyRes: ensureCors } });
-
-app.options('/health', (req, res) => {
+// /health → dispatcher (tem active_jobs, accounts)
+main.options('/health', (req, res) => {
   const origin = req.headers.origin || '';
   if (CORS_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -63,28 +26,50 @@ app.options('/health', (req, res) => {
   res.sendStatus(204);
 });
 
-app.get('/health', async (req, res) => {
+main.get('/health', async (req, res) => {
   const origin = req.headers.origin || '';
   if (CORS_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-  try {
-    const r = await fetch('http://localhost:3002/health');
-    const d = await r.json();
-    res.json(d);
-  } catch (e) {
-    res.status(502).json({ ok: false, error: e.message });
-  }
+  // Chamar directamente o router do dispatcherApp
+  req.url = '/health';
+  dispatcherApp(req, res);
 });
 
-app.use('/polygon',  toPolygon);
-app.use('/tron',     toPolygon);
-app.use('/dispatch', toDispatcher);
-app.use('/webhook',  toDispatcher);
-app.use('/jobs',     toDispatcher);
-app.use('/status',   toDispatcher);
-app.use('/',         toProxy);
+// Rotas polygon
+main.use('/polygon', polygonApp);
+main.use('/tron',    polygonApp);
 
-app.listen(RENDER_PORT, '0.0.0.0', () => {
-  console.log(`[index] router na porta ${RENDER_PORT}`);
+// Rotas dispatcher
+main.use('/dispatch', dispatcherApp);
+main.use('/webhook',  dispatcherApp);
+main.use('/jobs',     dispatcherApp);
+main.use('/status',   dispatcherApp);
+
+// Tudo o resto → proxy (/{jobId}/...)
+main.use('/', (req, res) => {
+  proxyServer.emit('request', req, res);
+});
+
+main.listen(PORT, '0.0.0.0', () => {
+  console.log(`[index] servidor unificado na porta ${PORT}`);
+  console.log(`  /polygon/* /tron/*              → polygon-microservice`);
+  console.log(`  /dispatch /webhook /jobs /status → dispatcher`);
+  console.log(`  /*                               → proxy`);
+
+  // Keep-alive unificado
+  if (process.env.RENDER || process.env.KEEP_ALIVE === 'true') {
+    const selfUrl = process.env.RENDER_EXTERNAL_URL
+      ? `${process.env.RENDER_EXTERNAL_URL}/health`
+      : `http://localhost:${PORT}/health`;
+    setInterval(async () => {
+      try {
+        await fetch(selfUrl, { signal: AbortSignal.timeout(5000) });
+        console.log(`[keep-alive] ping → ${new Date().toISOString()}`);
+      } catch (e) {
+        console.warn(`[keep-alive] falhou: ${e.message}`);
+      }
+    }, 13 * 60 * 1000);
+    console.log(`  keep-alive → ${selfUrl}`);
+  }
 });
