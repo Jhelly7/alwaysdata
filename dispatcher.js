@@ -30,7 +30,6 @@ app.use((req, res, next) => {
   const allowed = [
     'https://streamvault-admin.pages.dev',
     'https://pixgo.qzz.io',
-    'https://digital.pixgo.frii.site',
   ];
   const origin = req.headers.origin || '';
   if (allowed.includes(origin) || !origin) {
@@ -271,12 +270,8 @@ function startKeepAlive(port) {
   if (pipelineUrl) console.log(`  ✓ Keep-alive pipeline → ${pipelineUrl}`);
 }
 
-// ── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`StreamVault Dispatcher v2.0 — porta ${PORT}`);
-  accounts.forEach(a => console.log(`  ✓ Conta ${a.id}: ${a.owner}/${a.repo}`));
+// ── Export (para index.js) ────────────────────────────────────────────────────
+console.log(`StreamVault Dispatcher v2.0`);
+accounts.forEach(a => console.log(`  ✓ Conta ${a.id}: ${a.owner}/${a.repo}`));
 
-  if (process.env.RENDER || process.env.KEEP_ALIVE === 'true') {
-    startKeepAlive(PORT);
-  }
-});
+export { app };
