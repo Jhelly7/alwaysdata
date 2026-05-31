@@ -123,8 +123,7 @@ const server = http.createServer(async (req, res) => {
 
   // CORS
   res.setHeader('Access-Control-Allow-Origin',   ALLOWED_ORIGIN);
-  res.setHeader('Access-Control-Allow-Methods',  'GET, HEAD, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers',  'Content-Type, Authorization, x-api-key');
+  res.setHeader('Access-Control-Allow-Methods',  'GET, HEAD, OPTIONS');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Length, X-Cache');
 
   if (req.method === 'OPTIONS') {
@@ -213,11 +212,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`StreamVault Release Proxy v1.1 — porta ${PORT}`);
-  console.log(`  ✓ Storage: ${GITHUB_OWNER}/${GITHUB_REPO}`);
+// ── Export (para index.js) ────────────────────────────────────────────────────
+console.log(`StreamVault Release Proxy v1.1`);
+console.log(`  ✓ Storage: ${GITHUB_OWNER}/${GITHUB_REPO}`);
 
-  if (process.env.RENDER || process.env.KEEP_ALIVE === 'true') {
-    startKeepAlive(PORT);
-  }
-});
+export { server };
