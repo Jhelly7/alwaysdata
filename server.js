@@ -107,22 +107,19 @@ app.post('/tron/check',  requireSecret, handleCheck);
 // 404
 app.use((_req, res) => res.status(404).json({ error: 'Not Found' }));
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[polygon-service] A escutar na porta ${PORT}`);
-    console.log(`[polygon-service] Rede: Polygon (chain ${process.env.POLYGON_CHAIN_ID || '137'})`);
+// ── Export (para index.js) ────────────────────────────────────────────────────
+if (!process.env.WALLET_MNEMONIC && !process.env.WALLET_MNEMONIC_B64 &&
+    !process.env.TRON_MNEMONIC  && !process.env.TRON_MNEMONIC_B64) {
+    console.error('[polygon-service] CRÍTICO: WALLET_MNEMONIC ou WALLET_MNEMONIC_B64 não definido');
+}
+if (!process.env.POLYGON_RPC_URL) {
+    console.warn('[polygon-service] AVISO: POLYGON_RPC_URL não definido — a usar polygon-rpc.com (público, limite de taxa)');
+}
+if (!process.env.POLYGONSCAN_API_KEY) {
+    console.warn('[polygon-service] AVISO: POLYGONSCAN_API_KEY não definido — usando eth_getLogs como fallback');
+}
+if (!SECRET) {
+    console.warn('[polygon-service] AVISO: POLYGON_SERVICE_SECRET não definido — endpoint aberto');
+}
 
-    if (!process.env.WALLET_MNEMONIC && !process.env.WALLET_MNEMONIC_B64 &&
-        !process.env.TRON_MNEMONIC  && !process.env.TRON_MNEMONIC_B64) {
-        console.error('[polygon-service] CRÍTICO: WALLET_MNEMONIC ou WALLET_MNEMONIC_B64 não definido');
-    }
-    if (!process.env.POLYGON_RPC_URL) {
-        console.warn('[polygon-service] AVISO: POLYGON_RPC_URL não definido — a usar polygon-rpc.com (público, limite de taxa)');
-    }
-    if (!process.env.POLYGONSCAN_API_KEY) {
-        console.warn('[polygon-service] AVISO: POLYGONSCAN_API_KEY não definido — usando eth_getLogs como fallback');
-    }
-    if (!SECRET) {
-        console.warn('[polygon-service] AVISO: POLYGON_SERVICE_SECRET não definido — endpoint aberto');
-    }
-});
+export { app };
