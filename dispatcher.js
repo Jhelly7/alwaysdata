@@ -212,7 +212,7 @@ app.delete('/jobs/:jobId', auth, async (req, res) => {
 });
 
 // ── GET /status ──────────────────────────────────────────────────────────────
-app.get('/status', auth, (_, res) => {
+app.get('/status', (_, res) => {
   res.json({
     accounts: accounts.map(a => ({
       id: a.id, owner: a.owner, repo: a.repo,
