@@ -274,4 +274,4 @@ function startKeepAlive(port) {
 console.log(`StreamVault Dispatcher v2.0`);
 accounts.forEach(a => console.log(`  ✓ Conta ${a.id}: ${a.owner}/${a.repo}`));
 
-export { app };
+export { app, accounts };
