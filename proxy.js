@@ -212,8 +212,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// ── Export (para index.js) ────────────────────────────────────────────────────
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+// Quando executado directamente (`node proxy.js`) abre a porta.
+// Quando importado pelo index.js apenas exporta o server — index.js faz emit.
 console.log(`StreamVault Release Proxy v1.1`);
 console.log(`  ✓ Storage: ${GITHUB_OWNER}/${GITHUB_REPO}`);
+
+const isMain = process.argv[1] && new URL(import.meta.url).pathname === process.argv[1];
+if (isMain) {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`  ✓ Proxy a escutar na porta ${PORT}`);
+    startKeepAlive(PORT);
+  });
+}
 
 export { server };
