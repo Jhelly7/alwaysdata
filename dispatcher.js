@@ -395,12 +395,14 @@ function startKeepAlive(port) {
   if (pipelineUrl) console.log(`  ✓ Keep-alive pipeline → ${pipelineUrl}`);
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`StreamVault Dispatcher v3.2 a ouvir na porta ${PORT} (MAX_CONCURRENT=${MAX_CONCURRENT})`);
+// ── Init — chamado pelo index.js após o servidor principal fazer listen ────────
+// NÃO chama app.listen() — o dispatcher é montado como sub-router no servidor
+// unificado. O index.js chama dispatcherInit(port) no callback do seu listen.
+function dispatcherInit(port) {
+  console.log(`StreamVault Dispatcher v3.2 (MAX_CONCURRENT=${MAX_CONCURRENT})`);
   accounts.forEach(a => console.log(`  ✓ Conta ${a.id}: ${a.owner}/${a.repo}`));
-  startKeepAlive(PORT);
+  startKeepAlive(port);
   startWatchdog();
-});
+}
 
-export { app, accounts };
+export { app, accounts, dispatcherInit };
