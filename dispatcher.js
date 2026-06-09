@@ -1,31 +1,33 @@
-// dispatcher.js – StreamVault Dispatcher v2.0
+// dispatcher.js – StreamVault Dispatcher v3.0
 //
-// Gere 2 contas GitHub Actions em round-robin.
-// Substitui apenas o processQueue/processJob do server.js —
-// todas as rotas e lógica do server.js ficam intactas.
+// v2 → v3: fila FIFO com MAX_CONCURRENT slots.
+// Tudo o resto é idêntico ao v2.
 //
-// VARS DE AMBIENTE (.env — mesmo ficheiro do server.js):
-//   DISPATCHER_PORT      — porta do dispatcher (default: 3002)
-//   GH_WORKFLOW_FILE     — nome do workflow (default: process.yml)
+// NOVO:
+//   • queue[]        — jobs aguardando slot (FIFO)
+//   • running        — contador de slots activos
+//   • MAX_CONCURRENT — env var (default: 1)
+//   • processNext()  — avança fila quando slot é libertado
+//
+// POST /dispatch  → entra na fila; dispara imediatamente se há slot livre
+// POST /webhook   → liberta slot + chama processNext()
+// GET  /status    → expõe queue[] além de jobs
+// GET  /health    → inclui queued_jobs + max_concurrent
+//
+// VARS DE AMBIENTE:
+//   MAX_CONCURRENT       — slots simultâneos (default: 1)
+//   DISPATCHER_PORT      — porta (default: 3002)
+//   GH_WORKFLOW_FILE     — nome do workflow (default: StreamVault.yml)
 //   GH_WORKFLOW_REF      — branch (default: main)
-//
-//   Conta 1:
-//   GH_ACCOUNT_1_TOKEN   — PAT (scope: repo, workflow)
-//   GH_ACCOUNT_1_OWNER   — username
-//   GH_ACCOUNT_1_REPO    — repo com o process.yml
-//
-//   Conta 2:
-//   GH_ACCOUNT_2_TOKEN
-//   GH_ACCOUNT_2_OWNER
-//   GH_ACCOUNT_2_REPO
+//   GH_ACCOUNT_N_TOKEN / _OWNER / _REPO
 
 import 'dotenv/config';
 import express from 'express';
 
-const app  = express();
+const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// ── CORS — permite chamadas do painel admin (pages.dev e domínio próprio) ────
+// ── CORS ─────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   const allowed = [
     'https://streamvault-admin.pages.dev',
@@ -41,12 +43,13 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT          = parseInt(process.env.PORT || process.env.DISPATCHER_PORT || '3002');
-const WORKFLOW_FILE = process.env.GH_WORKFLOW_FILE || 'process.yml';
-const WORKFLOW_REF  = process.env.GH_WORKFLOW_REF  || 'main';
-const ADMIN_KEY     = process.env.ADMIN_API_KEY    || '';
+const PORT           = parseInt(process.env.PORT || process.env.DISPATCHER_PORT || '3002');
+const WORKFLOW_FILE  = process.env.GH_WORKFLOW_FILE || 'StreamVault.yml';
+const WORKFLOW_REF   = process.env.GH_WORKFLOW_REF  || 'main';
+const ADMIN_KEY      = process.env.ADMIN_API_KEY    || '';
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '1');
 
-// ── Carregar contas ──────────────────────────────────────────────────────────
+// ── Carregar contas ───────────────────────────────────────────────────────────
 function loadAccounts() {
   const accounts = [];
   let n = 1;
@@ -67,7 +70,7 @@ if (accounts.length === 0) {
   process.exit(1);
 }
 
-// ── Round-robin — conta com menos jobs activos, desempate por lastUsed ───────
+// ── Round-robin — conta com menos jobs activos, desempate por lastUsed ────────
 function selectAccount() {
   return [...accounts].sort((a, b) => {
     if (a.activeJobs !== b.activeJobs) return a.activeJobs - b.activeJobs;
@@ -77,7 +80,7 @@ function selectAccount() {
   })[0];
 }
 
-// ── GitHub API ───────────────────────────────────────────────────────────────
+// ── GitHub API ────────────────────────────────────────────────────────────────
 function ghFetch(url, token, opts = {}) {
   return fetch(url, {
     ...opts,
@@ -85,7 +88,7 @@ function ghFetch(url, token, opts = {}) {
       'Authorization':        `Bearer ${token}`,
       'Accept':               'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent':           'StreamVault-Dispatcher/2.0',
+      'User-Agent':           'StreamVault-Dispatcher/3.0',
       ...(opts.headers || {}),
     },
   });
@@ -111,10 +114,50 @@ async function cancelRun(account, runId) {
   );
 }
 
-// ── Job store ────────────────────────────────────────────────────────────────
+// ── Estado FIFO ───────────────────────────────────────────────────────────────
 const jobStore = new Map();
+const queue    = [];   // jobs aguardando slot — ordem FIFO
+let   running  = 0;    // slots activos no GitHub Actions
 
-// ── Auth middleware ──────────────────────────────────────────────────────────
+// ── processNext — tira o próximo da fila e dispara se há slot livre ───────────
+async function processNext() {
+  if (running >= MAX_CONCURRENT || queue.length === 0) return;
+
+  const job     = queue.shift();
+  const account = selectAccount();
+
+  job.status       = 'dispatching';
+  job.accountId    = account.id;
+  job.accountOwner = account.owner;
+
+  try {
+    const r = await triggerWorkflow(account, job.inputs);
+    if (!r.ok) {
+      const t = await r.text();
+      job.status      = 'dispatch_error';
+      job.errorDetail = t.slice(0, 300);
+      console.error(`[DISPATCH_ERR] job=${job.jobId} HTTP ${r.status}: ${job.errorDetail}`);
+      // slot não foi consumido — tentar o próximo
+      processNext();
+      return;
+    }
+
+    account.activeJobs++;
+    account.lastUsed = new Date().toISOString();
+    job.status       = 'dispatched';
+    job.dispatchedAt = new Date().toISOString();
+    running++;
+
+    console.log(`[DISPATCH] job=${job.jobId} → ${account.owner} (running=${running}/${MAX_CONCURRENT} queued=${queue.length})`);
+  } catch (e) {
+    job.status      = 'dispatch_error';
+    job.errorDetail = e.message;
+    console.error(`[DISPATCH_ERR] job=${job.jobId}: ${e.message}`);
+    processNext();
+  }
+}
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
 function auth(req, res, next) {
   if (!ADMIN_KEY) return next();
   const key = req.headers['x-api-key'] || req.query.key;
@@ -122,68 +165,79 @@ function auth(req, res, next) {
   next();
 }
 
-// ── POST /dispatch ───────────────────────────────────────────────────────────
-// FIX: thumbnail_url adicionado ao destructuring e aos inputs do workflow.
+// ── POST /dispatch ────────────────────────────────────────────────────────────
 app.post('/dispatch', auth, async (req, res) => {
   const {
     job_id,
     video_url         = '',
-    thumbnail_url     = '',   // ← FIX: estava ausente, thumbnail nunca chegava ao workflow
+    thumbnail_url     = '',
     seg_duration      = '4',
     max_encode_height = '720',
     warm_concurrency  = '8',
     metadata          = {},
+    season_number     = '0',
+    episode_number    = '0',
+    episode_title     = '',
+    file_indices      = '',
   } = req.body;
 
   if (!job_id) return res.status(400).json({ error: 'job_id obrigatório' });
   if (jobStore.has(job_id)) return res.status(409).json({ error: 'Job já existe' });
 
-  const account = selectAccount();
-
   const inputs = {
     job_id,
     video_url,
-    thumbnail_url,            // ← FIX: agora enviado para o workflow
+    thumbnail_url,
     seg_duration:      String(seg_duration),
     max_encode_height: String(max_encode_height),
     warm_concurrency:  String(warm_concurrency),
-    metadata: typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
+    metadata:          typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
+    season_number:     String(season_number),
+    episode_number:    String(episode_number),
+    episode_title:     String(episode_title),
+    file_indices:      String(file_indices),
   };
 
-  try {
-    const r = await triggerWorkflow(account, inputs);
-    if (!r.ok) {
-      const t = await r.text();
-      return res.status(502).json({ error: `GitHub dispatch falhou (${r.status})`, details: t.slice(0,300) });
-    }
+  const queuePosition = queue.length;
 
-    account.activeJobs++;
-    account.lastUsed = new Date().toISOString();
+  const job = {
+    jobId:        job_id,
+    accountId:    null,
+    accountOwner: null,
+    status:       'queued',
+    createdAt:    new Date().toISOString(),
+    dispatchedAt: null,
+    completedAt:  null,
+    inputs,
+  };
 
-    jobStore.set(job_id, {
-      jobId:        job_id,
-      accountId:    account.id,
-      accountOwner: account.owner,
-      status:       'dispatched',
-      dispatchedAt: new Date().toISOString(),
-      inputs,
-    });
+  jobStore.set(job_id, job);
+  queue.push(job);
 
-    console.log(`[DISPATCH] job=${job_id} → ${account.owner} (active=${account.activeJobs}) thumb=${thumbnail_url ? '✓' : '—'}`);
-    res.json({ ok: true, job_id, account: account.owner, account_id: account.id });
+  console.log(`[QUEUE] job=${job_id} pos=${queuePosition} (queued=${queue.length} running=${running}/${MAX_CONCURRENT})`);
 
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  // dispara imediatamente se há slot livre — caso contrário fica em queue[]
+  processNext();
+
+  res.json({
+    ok:             true,
+    job_id,
+    status:         job.status,
+    queue_position: queuePosition,
+  });
 });
 
-// ── POST /webhook — callback do Actions quando job termina ───────────────────
+// ── POST /webhook — callback do Actions (step 14b) ────────────────────────────
+// Body: { job_id, status: 'done' | 'failed' }
+// Liberta o slot e avança a fila — chamado com if:always() no workflow.
 app.post('/webhook', async (req, res) => {
   const { job_id, status } = req.body;
   if (!job_id) return res.status(400).json({ error: 'job_id obrigatório' });
 
   const job = jobStore.get(job_id);
   if (!job) return res.status(404).json({ error: 'Job não encontrado' });
+
+  const wasRunning = job.status === 'dispatched' || job.status === 'dispatching';
 
   job.status      = status || 'done';
   job.completedAt = new Date().toISOString();
@@ -192,7 +246,14 @@ app.post('/webhook', async (req, res) => {
   const account = accounts.find(a => a.id === job.accountId);
   if (account && account.activeJobs > 0) account.activeJobs--;
 
-  console.log(`[WEBHOOK] job=${job_id} status=${status} conta=${account?.owner}`);
+  if (wasRunning && running > 0) {
+    running--;
+    console.log(`[WEBHOOK] job=${job_id} status=${status} → running=${running}/${MAX_CONCURRENT} queued=${queue.length}`);
+    processNext();
+  } else {
+    console.log(`[WEBHOOK] job=${job_id} status=${status} (não estava running — slot inalterado)`);
+  }
+
   res.json({ ok: true });
 });
 
@@ -201,43 +262,57 @@ app.delete('/jobs/:jobId', auth, async (req, res) => {
   const job = jobStore.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job não encontrado' });
 
+  if (job.status === 'queued') {
+    // remove da fila sem tocar em running
+    const idx = queue.indexOf(job);
+    if (idx !== -1) queue.splice(idx, 1);
+    job.status = 'cancelled';
+    console.log(`[CANCEL] job=${job.jobId} removido da fila (queued=${queue.length})`);
+    return res.json({ ok: true, was_queued: true });
+  }
+
   const account = accounts.find(a => a.id === job.accountId);
   if (account && job.runId) {
     try { await cancelRun(account, job.runId); } catch {}
   }
-
-  job.status = 'cancelled';
   if (account && account.activeJobs > 0) account.activeJobs--;
-  res.json({ ok: true });
+  if (running > 0) { running--; processNext(); }
+  job.status = 'cancelled';
+
+  res.json({ ok: true, was_queued: false });
 });
 
-// ── GET /status ──────────────────────────────────────────────────────────────
+// ── GET /status ───────────────────────────────────────────────────────────────
 app.get('/status', (_, res) => {
   res.json({
+    running,
+    max_concurrent: MAX_CONCURRENT,
+    queued_jobs:    queue.length,
     accounts: accounts.map(a => ({
       id: a.id, owner: a.owner, repo: a.repo,
       activeJobs: a.activeJobs, lastUsed: a.lastUsed,
     })),
-    jobs: [...jobStore.values()],
+    jobs:  [...jobStore.values()],
+    queue: queue.map((j, i) => ({ job_id: j.jobId, position: i, createdAt: j.createdAt })),
   });
 });
 
-// ── GET /health ──────────────────────────────────────────────────────────────
+// ── GET /health ───────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => {
   res.json({
-    ok: true,
-    accounts: accounts.length,
-    active_jobs: accounts.reduce((s,a) => s + a.activeJobs, 0),
-    workflow: `${WORKFLOW_FILE}@${WORKFLOW_REF}`,
+    ok:             true,
+    accounts:       accounts.length,
+    active_jobs:    running,
+    queued_jobs:    queue.length,
+    max_concurrent: MAX_CONCURRENT,
+    workflow:       `${WORKFLOW_FILE}@${WORKFLOW_REF}`,
   });
 });
 
-// ── Keep-alive — evita que o Render (free tier) adormeça ────────────────────
-// Faz self-ping ao /health a cada 14 minutos (Render dorme após 15min idle).
-// FIX: também faz ping à PIPELINE_API para evitar cold start no momento do registo.
+// ── Keep-alive ────────────────────────────────────────────────────────────────
 function startKeepAlive(port) {
-  const interval  = 14 * 60 * 1000; // 14 minutos
-  const selfUrl   = process.env.RENDER_EXTERNAL_URL
+  const interval    = 14 * 60 * 1000;
+  const selfUrl     = process.env.RENDER_EXTERNAL_URL
     ? `${process.env.RENDER_EXTERNAL_URL}/health`
     : `http://localhost:${port}/health`;
   const pipelineUrl = process.env.PIPELINE_API
@@ -245,17 +320,12 @@ function startKeepAlive(port) {
     : null;
 
   setInterval(async () => {
-    // Ping ao próprio dispatcher
     try {
       const r = await fetch(selfUrl);
       console.log(`[keep-alive] dispatcher → ${r.status} (${new Date().toISOString()})`);
     } catch (e) {
       console.warn(`[keep-alive] dispatcher ping falhou: ${e.message}`);
     }
-
-    // FIX: Ping à pipeline API para mantê-la acordada e a ligação Turso activa.
-    // Sem isto, após 15min idle o Render adormece e o primeiro registo recebe 500
-    // porque o servidor acorda mas a ligação à BD (Turso/libsql) ainda não está pronta.
     if (pipelineUrl) {
       try {
         const r = await fetch(pipelineUrl, { signal: AbortSignal.timeout(10000) });
@@ -270,8 +340,8 @@ function startKeepAlive(port) {
   if (pipelineUrl) console.log(`  ✓ Keep-alive pipeline → ${pipelineUrl}`);
 }
 
-// ── Export (para index.js) ────────────────────────────────────────────────────
-console.log(`StreamVault Dispatcher v2.0`);
+// ── Export ────────────────────────────────────────────────────────────────────
+console.log(`StreamVault Dispatcher v3.0 (MAX_CONCURRENT=${MAX_CONCURRENT})`);
 accounts.forEach(a => console.log(`  ✓ Conta ${a.id}: ${a.owner}/${a.repo}`));
 
 export { app, accounts };
