@@ -1,8 +1,8 @@
 // index.js — ponto de entrada único
 import express from 'express';
-import { app as polygonApp }              from './server.js';
-import { app as dispatcherApp, accounts } from './dispatcher.js';
-import { server as proxyServer }          from './proxy.js';
+import { app as polygonApp }                        from './server.js';
+import { app as dispatcherApp, accounts, dispatcherInit } from './dispatcher.js';
+import { server as proxyServer }                    from './proxy.js';
 
 const PORT = process.env.PORT || '10000';
 
@@ -44,9 +44,6 @@ main.get('/health', (_req, res) => {
 main.use(dispatcherApp);
 
 // ── Polygon + Tron — depois do dispatcher, restringido aos seus prefixos ──────
-// O polygonApp tem `app.use((_req, res) => res.status(404).json({error:'Not Found'}))`
-// no fim — se montado na raiz engole tudo. Montar apenas em /polygon e /tron.
-// req.originalUrl preserva o path completo para as rotas internas funcionarem.
 main.use(['/polygon', '/tron'], (req, res, next) => {
   req.url = req.originalUrl;
   polygonApp(req, res, next);
@@ -64,20 +61,8 @@ main.listen(PORT, '0.0.0.0', () => {
   console.log(`  /polygon/* /tron/*               → polygon-microservice`);
   console.log(`  /*                               → proxy`);
 
-  if (process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE === 'true') {
-    const selfUrl = process.env.RENDER_EXTERNAL_URL
-      ? `${process.env.RENDER_EXTERNAL_URL}/health`
-      : `http://localhost:${PORT}/health`;
-
-    setInterval(async () => {
-      try {
-        await fetch(selfUrl, { signal: AbortSignal.timeout(5000) });
-        console.log(`[keep-alive] ping → ${new Date().toISOString()}`);
-      } catch (e) {
-        console.warn(`[keep-alive] falhou: ${e.message}`);
-      }
-    }, 13 * 60 * 1000);
-
-    console.log(`  keep-alive → ${selfUrl}`);
-  }
+  // ── Inicializar dispatcher (watchdog + keep-alive) ──────────────────────────
+  // CRÍTICO: sem esta chamada o watchdog nunca arranca e a fila fica presa
+  // após qualquer reinício do Render (running=0 mas webhook nunca chega).
+  dispatcherInit(PORT);
 });
