@@ -366,7 +366,7 @@ app.get('/health', (_, res) => {
 
 // ── Keep-alive ────────────────────────────────────────────────────────────────
 function startKeepAlive(port) {
-  const interval    = 14 * 60 * 1000;
+  const interval    = 9 * 60 * 1000;  // 9min < 15min sleep do Render free tier
   const selfUrl     = process.env.RENDER_EXTERNAL_URL
     ? `${process.env.RENDER_EXTERNAL_URL}/health`
     : `http://localhost:${port}/health`;
