@@ -15,17 +15,15 @@ const main = express();
 // CORS é tratado dentro de cada sub-app (dispatcherApp já tem o seu próprio
 // middleware). Não duplicar aqui para evitar headers conflitantes.
 
-// Rotas polygon — montadas SEM prefixo, pela mesma razão do dispatcher:
-// polygonApp já define internamente /polygon/derive, /tron/derive, etc.
-// Se usarmos main.use('/polygon', polygonApp), o Express remove '/polygon'
-// antes de entrar na sub-app e as rotas internas nunca batem (404).
-main.use(polygonApp);
-
-// Rotas dispatcher — montadas SEM prefixo, porque dispatcherApp já define
-// os paths completos internamente (app.post('/dispatch', ...), etc).
-// FIX: usar main.use('/dispatch', dispatcherApp) removia o prefixo /dispatch
-// antes de entrar no sub-app, fazendo a rota interna nunca bater (404).
+// Dispatcher primeiro — tem CORS configurado e define /health, /status,
+// /dispatch, /webhook, /jobs. Precisa de vir antes do polygonApp porque
+// ambos definem GET /health; o Express para no primeiro que responder.
+// Se polygonApp vier primeiro, o /health é servido sem headers CORS e o
+// browser bloqueia (ERR_FAILED 200 OK com "No Access-Control-Allow-Origin").
 main.use(dispatcherApp);
+
+// Polygon a seguir — define /polygon/*, /tron/* (prefixos completos internos).
+main.use(polygonApp);
 
 // Catch-all — proxy desligado, devolve 404 (Cloudflare já não envia tráfego aqui)
 main.use('/', (req, res) => {
