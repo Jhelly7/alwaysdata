@@ -61,9 +61,10 @@ async function fetchTransferLogs(address, signal) {
     const addr     = address.toLowerCase();
 
     if (apiKey) {
-        // Polygonscan API — topic2 = endereço de destino com padding 32 bytes
+        // Etherscan API V2 — Polygonscan migrou para api.etherscan.io/v2 com chainid=137.
+        // A chave POLYGONSCAN_API_KEY continua válida — só o endpoint mudou.
         const topic2 = '0x' + addr.replace('0x', '').padStart(64, '0');
-        const url = `https://api.polygonscan.com/api?module=logs&action=getLogs` +
+        const url = `https://api.etherscan.io/v2/api?chainid=137&module=logs&action=getLogs` +
             `&address=${contract}` +
             `&topic0=${TRANSFER_TOPIC}` +
             `&topic2=${topic2}` +
