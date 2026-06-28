@@ -15,9 +15,11 @@ const main = express();
 // CORS é tratado dentro de cada sub-app (dispatcherApp já tem o seu próprio
 // middleware). Não duplicar aqui para evitar headers conflitantes.
 
-// Rotas polygon
-main.use('/polygon', polygonApp);
-main.use('/tron',    polygonApp);
+// Rotas polygon — montadas SEM prefixo, pela mesma razão do dispatcher:
+// polygonApp já define internamente /polygon/derive, /tron/derive, etc.
+// Se usarmos main.use('/polygon', polygonApp), o Express remove '/polygon'
+// antes de entrar na sub-app e as rotas internas nunca batem (404).
+main.use(polygonApp);
 
 // Rotas dispatcher — montadas SEM prefixo, porque dispatcherApp já define
 // os paths completos internamente (app.post('/dispatch', ...), etc).
