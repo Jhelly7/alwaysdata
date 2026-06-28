@@ -19,6 +19,19 @@ function polygonscanApiKey()  { return process.env.POLYGONSCAN_API_KEY || ''; }
 function usdtContract()       { return (process.env.USDT_CONTRACT      || '0xc2132D05D31c914a87C6611C10748AEb04B58e8F').toLowerCase(); }
 const USDT_DECIMALS = 6; // USDT no Polygon tem 6 casas decimais
 
+/**
+ * Lê JSON de uma Response com mensagem de erro legível se o corpo não for JSON.
+ * Evita "Unexpected token '<'" quando o RPC devolve HTML (rate limit / downtime).
+ */
+async function safeJson(resp, label) {
+  const ct = resp.headers.get('content-type') || '';
+  if (!ct.includes('application/json') && !ct.includes('text/json')) {
+    const preview = (await resp.text()).slice(0, 120).replace(/\s+/g, ' ');
+    throw new Error(`${label}: resposta não-JSON (${resp.status}) — ${preview}`);
+  }
+  return resp.json();
+}
+
 // ERC-20 Transfer event topic: keccak256("Transfer(address,address,uint256)")
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
@@ -33,7 +46,7 @@ async function getCurrentBlock(signal) {
         signal,
     });
     if (!resp.ok) throw new Error(`eth_blockNumber falhou: ${resp.status}`);
-    const data = await resp.json();
+    const data = await safeJson(resp, 'eth_blockNumber');
     if (data.error) throw new Error(`eth_blockNumber erro: ${data.error.message}`);
     return parseInt(data.result, 16);
 }
@@ -60,7 +73,7 @@ async function fetchTransferLogs(address, signal) {
 
         const resp = await fetch(url, { signal });
         if (!resp.ok) throw new Error(`Polygonscan respondeu ${resp.status}`);
-        const data = await resp.json();
+        const data = await safeJson(resp, 'Polygonscan');
         // status '0' com result [] = sem resultados — não é erro
         if (data.status !== '1' && Array.isArray(data.result) && data.result.length === 0) return [];
         if (data.status !== '1') throw new Error(`Polygonscan erro: ${data.message}`);
@@ -88,7 +101,7 @@ async function fetchTransferLogs(address, signal) {
         signal,
     });
     if (!resp.ok) throw new Error(`eth_getLogs falhou: ${resp.status}`);
-    const data = await resp.json();
+    const data = await safeJson(resp, 'eth_getLogs');
     if (data.error) throw new Error(`eth_getLogs erro: ${data.error.message}`);
     return data.result || [];
 }
