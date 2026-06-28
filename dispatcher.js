@@ -30,6 +30,7 @@ app.use((req, res, next) => {
   const allowed = [
     'https://streamvault-admin.pages.dev',
     'https://pixgo.qzz.io',
+    'https://digital.pixgo.frii.site',
   ];
   const origin = req.headers.origin || '';
   if (allowed.includes(origin) || !origin) {
