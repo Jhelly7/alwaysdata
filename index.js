@@ -5,36 +5,57 @@
 import express from 'express';
 import { app as polygonApp }    from './server.js';
 import { app as dispatcherApp } from './dispatcher.js';
-// FIX: proxy.js desligado — Cloudflare redireciona /{jobId}/... directamente
-// para a Release pública do GitHub (Single Redirects), sem passar pelo Render.
+import { server as proxyServer } from './proxy.js';
 
 const PORT = process.env.PORT || '10000';
 
+const CORS_ORIGINS = [
+  'https://streamvault-admin.pages.dev',
+  'https://pixgo.qzz.io',
+  'https://digital.pixgo.frii.site',
+];
+
 const main = express();
 
-// CORS é tratado dentro de cada sub-app (dispatcherApp já tem o seu próprio
-// middleware). Não duplicar aqui para evitar headers conflitantes.
+// /health → dispatcher (tem active_jobs, accounts)
+main.options('/health', (req, res) => {
+  const origin = req.headers.origin || '';
+  if (CORS_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  res.sendStatus(204);
+});
+
+main.get('/health', async (req, res) => {
+  const origin = req.headers.origin || '';
+  if (CORS_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  // Chamar directamente o router do dispatcherApp
+  req.url = '/health';
+  dispatcherApp(req, res);
+});
 
 // Rotas polygon
 main.use('/polygon', polygonApp);
 main.use('/tron',    polygonApp);
 
-// Rotas dispatcher — montadas SEM prefixo, porque dispatcherApp já define
-// os paths completos internamente (app.post('/dispatch', ...), etc).
-// FIX: usar main.use('/dispatch', dispatcherApp) removia o prefixo /dispatch
-// antes de entrar no sub-app, fazendo a rota interna nunca bater (404).
-main.use(dispatcherApp);
+// Rotas dispatcher
+main.use('/dispatch', dispatcherApp);
+main.use('/webhook',  dispatcherApp);
+main.use('/jobs',     dispatcherApp);
+main.use('/status',   dispatcherApp);
 
-// Catch-all — proxy desligado, devolve 404 (Cloudflare já não envia tráfego aqui)
+// Tudo o resto → proxy (/{jobId}/...)
 main.use('/', (req, res) => {
-  res.status(404).json({ error: 'Not Found' });
+  proxyServer.emit('request', req, res);
 });
 
 main.listen(PORT, '0.0.0.0', () => {
   console.log(`[index] servidor unificado na porta ${PORT}`);
   console.log(`  /polygon/* /tron/*              → polygon-microservice`);
   console.log(`  /dispatch /webhook /jobs /status → dispatcher`);
-  console.log(`  /*                               → 404 (proxy desligado)`);
+  console.log(`  /*                               → proxy`);
 
   // Keep-alive unificado
   if (process.env.RENDER || process.env.KEEP_ALIVE === 'true') {
