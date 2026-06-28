@@ -1,27 +1,31 @@
-// dispatcher.js – StreamVault Dispatcher v3.2
+// dispatcher.js – StreamVault Dispatcher v2.0
 //
-// v3.1 → v3.2: watchdog TTL para jobs que falham sem chamar /webhook.
+// Gere 2 contas GitHub Actions em round-robin.
+// Substitui apenas o processQueue/processJob do server.js —
+// todas as rotas e lógica do server.js ficam intactas.
 //
-// PROBLEMA v3.1:
-//   Se um job falha antes do step 14b (webhook), o slot fica preso
-//   indefinidamente — crash do runner, timeout de 340min, Render restart,
-//   qualquer falha que impeça o webhook de ser chamado.
+// VARS DE AMBIENTE (.env — mesmo ficheiro do server.js):
+//   DISPATCHER_PORT      — porta do dispatcher (default: 3002)
+//   GH_WORKFLOW_FILE     — nome do workflow (default: process.yml)
+//   GH_WORKFLOW_REF      — branch (default: main)
 //
-// SOLUÇÃO:
-//   JOB_TTL_MS — tempo máximo de vida de um job (default: 360min > 340min do workflow).
-//   Watchdog corre a cada WATCHDOG_INTERVAL_MS e força running-- em jobs
-//   que ultrapassaram o TTL sem receberem webhook.
-//   No arranque, running=0 sempre (Render restart = estado limpo + watchdog
-//   detecta jobs órfãos se o jobStore for persistido; sem persistência, a
-//   fila simplesmente recomeça do zero, que é o comportamento correcto).
+//   Conta 1:
+//   GH_ACCOUNT_1_TOKEN   — PAT (scope: repo, workflow)
+//   GH_ACCOUNT_1_OWNER   — username
+//   GH_ACCOUNT_1_REPO    — repo com o process.yml
+//
+//   Conta 2:
+//   GH_ACCOUNT_2_TOKEN
+//   GH_ACCOUNT_2_OWNER
+//   GH_ACCOUNT_2_REPO
 
 import 'dotenv/config';
 import express from 'express';
 
-const app = express();
+const app  = express();
 app.use(express.json({ limit: '1mb' }));
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
+// ── CORS — permite chamadas do painel admin (pages.dev e domínio próprio) ────
 app.use((req, res, next) => {
   const allowed = [
     'https://streamvault-admin.pages.dev',
@@ -37,17 +41,12 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT                 = parseInt(process.env.PORT || process.env.DISPATCHER_PORT || '3002');
-const WORKFLOW_FILE        = process.env.GH_WORKFLOW_FILE       || 'StreamVault.yml';
-const WORKFLOW_REF         = process.env.GH_WORKFLOW_REF        || 'main';
-const ADMIN_KEY            = process.env.ADMIN_API_KEY          || '';
-const MAX_CONCURRENT       = parseInt(process.env.MAX_CONCURRENT       || '1');
-// TTL ligeiramente acima do timeout-minutes do workflow (340min) para não
-// cortar jobs legítimos ainda a correr. Ajustar se o workflow mudar.
-const JOB_TTL_MS           = parseInt(process.env.JOB_TTL_MS           || String(360 * 60 * 1000));
-const WATCHDOG_INTERVAL_MS = parseInt(process.env.WATCHDOG_INTERVAL_MS || String(5  * 60 * 1000));
+const PORT          = parseInt(process.env.PORT || process.env.DISPATCHER_PORT || '3002');
+const WORKFLOW_FILE = process.env.GH_WORKFLOW_FILE || 'process.yml';
+const WORKFLOW_REF  = process.env.GH_WORKFLOW_REF  || 'main';
+const ADMIN_KEY     = process.env.ADMIN_API_KEY    || '';
 
-// ── Carregar contas ───────────────────────────────────────────────────────────
+// ── Carregar contas ──────────────────────────────────────────────────────────
 function loadAccounts() {
   const accounts = [];
   let n = 1;
@@ -68,7 +67,7 @@ if (accounts.length === 0) {
   process.exit(1);
 }
 
-// ── Round-robin ───────────────────────────────────────────────────────────────
+// ── Round-robin — conta com menos jobs activos, desempate por lastUsed ───────
 function selectAccount() {
   return [...accounts].sort((a, b) => {
     if (a.activeJobs !== b.activeJobs) return a.activeJobs - b.activeJobs;
@@ -78,7 +77,7 @@ function selectAccount() {
   })[0];
 }
 
-// ── GitHub API ────────────────────────────────────────────────────────────────
+// ── GitHub API ───────────────────────────────────────────────────────────────
 function ghFetch(url, token, opts = {}) {
   return fetch(url, {
     ...opts,
@@ -86,7 +85,7 @@ function ghFetch(url, token, opts = {}) {
       'Authorization':        `Bearer ${token}`,
       'Accept':               'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent':           'StreamVault-Dispatcher/3.2',
+      'User-Agent':           'StreamVault-Dispatcher/2.0',
       ...(opts.headers || {}),
     },
   });
@@ -112,103 +111,10 @@ async function cancelRun(account, runId) {
   );
 }
 
-// ── Estado FIFO ───────────────────────────────────────────────────────────────
+// ── Job store ────────────────────────────────────────────────────────────────
 const jobStore = new Map();
-const queue    = [];
-let   running  = 0;
 
-// ── Mutex ─────────────────────────────────────────────────────────────────────
-let dispatchLock = false;
-
-async function processNext() {
-  if (dispatchLock) return;
-  if (running >= MAX_CONCURRENT || queue.length === 0) return;
-
-  dispatchLock = true;
-  try {
-    if (running >= MAX_CONCURRENT || queue.length === 0) return;
-
-    const job     = queue.shift();
-    const account = selectAccount();
-
-    job.status       = 'dispatching';
-    job.accountId    = account.id;
-    job.accountOwner = account.owner;
-
-    try {
-      const r = await triggerWorkflow(account, job.inputs);
-      if (!r.ok) {
-        const t = await r.text();
-        job.status      = 'dispatch_error';
-        job.errorDetail = t.slice(0, 300);
-        console.error(`[DISPATCH_ERR] job=${job.jobId} HTTP ${r.status}: ${job.errorDetail}`);
-      } else {
-        account.activeJobs++;
-        account.lastUsed = new Date().toISOString();
-        job.status       = 'dispatched';
-        job.dispatchedAt = new Date().toISOString();
-        running++;
-        console.log(`[DISPATCH] job=${job.jobId} → ${account.owner} (running=${running}/${MAX_CONCURRENT} queued=${queue.length})`);
-      }
-    } catch (e) {
-      job.status      = 'dispatch_error';
-      job.errorDetail = e.message;
-      console.error(`[DISPATCH_ERR] job=${job.jobId}: ${e.message}`);
-    }
-  } finally {
-    dispatchLock = false;
-    if (queue.length > 0 && running < MAX_CONCURRENT) {
-      processNext().catch(e => console.error('[processNext unexpected]', e.message));
-    }
-  }
-}
-
-// ── Watchdog ──────────────────────────────────────────────────────────────────
-// Corre a cada WATCHDOG_INTERVAL_MS. Para cada job 'dispatched' que ultrapassou
-// JOB_TTL_MS desde dispatchedAt, força a libertação do slot e avança a fila.
-// Isto cobre: crash do runner, timeout do workflow, Render restart (running=0
-// no boot, mas jobs em 'dispatched' no store seriam órfãos se o store
-// sobrevivesse — neste caso não sobrevive, então o watchdog é sobretudo
-// para jobs que ficam presos dentro da mesma sessão do processo).
-function startWatchdog() {
-  setInterval(() => {
-    const now        = Date.now();
-    let   expired    = 0;
-
-    for (const job of jobStore.values()) {
-      if (job.status !== 'dispatched' && job.status !== 'dispatching') continue;
-
-      const dispatchedAt = job.dispatchedAt ? new Date(job.dispatchedAt).getTime() : 0;
-      const age          = now - dispatchedAt;
-
-      if (age < JOB_TTL_MS) continue;
-
-      // Job expirou sem webhook — forçar libertação
-      console.warn(`[WATCHDOG] job=${job.jobId} expirou após ${Math.round(age/60000)}min sem webhook → forçando slot livre`);
-      job.status      = 'timeout';
-      job.completedAt = new Date().toISOString();
-
-      const account = accounts.find(a => a.id === job.accountId);
-      if (account && account.activeJobs > 0) account.activeJobs--;
-
-      if (running > 0) {
-        running--;
-        expired++;
-      }
-    }
-
-    if (expired > 0) {
-      console.log(`[WATCHDOG] ${expired} slot(s) libertado(s) → running=${running}/${MAX_CONCURRENT} queued=${queue.length}`);
-      processNext().catch(e => console.error('[processNext unexpected]', e.message));
-    }
-  }, WATCHDOG_INTERVAL_MS);
-
-  const ttlMin      = Math.round(JOB_TTL_MS / 60000);
-  const intervalMin = Math.round(WATCHDOG_INTERVAL_MS / 60000);
-  console.log(`  ✓ Watchdog activo — TTL=${ttlMin}min, intervalo=${intervalMin}min`);
-}
-
-// ── Auth middleware ───────────────────────────────────────────────────────────
+// ── Auth middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
   if (!ADMIN_KEY) return next();
   const key = req.headers['x-api-key'] || req.query.key;
@@ -216,7 +122,8 @@ function auth(req, res, next) {
   next();
 }
 
-// ── POST /dispatch ────────────────────────────────────────────────────────────
+// ── POST /dispatch ───────────────────────────────────────────────────────────
+// FIX: thumbnail_url adicionado ao destructuring e aos inputs do workflow.
 app.post('/dispatch', auth, async (req, res) => {
   const {
     job_id,
@@ -226,6 +133,8 @@ app.post('/dispatch', auth, async (req, res) => {
     max_encode_height = '720',
     warm_concurrency  = '8',
     metadata          = {},
+    // ── FIX: campos de série/anime/dorama estavam ausentes — o coordinator
+    // no process.yml depende de season_number para rotular os jobs filhos.
     season_number     = '0',
     episode_number    = '0',
     episode_title     = '',
@@ -235,6 +144,8 @@ app.post('/dispatch', auth, async (req, res) => {
   if (!job_id) return res.status(400).json({ error: 'job_id obrigatório' });
   if (jobStore.has(job_id)) return res.status(409).json({ error: 'Job já existe' });
 
+  const account = selectAccount();
+
   const inputs = {
     job_id,
     video_url,
@@ -242,52 +153,48 @@ app.post('/dispatch', auth, async (req, res) => {
     seg_duration:      String(seg_duration),
     max_encode_height: String(max_encode_height),
     warm_concurrency:  String(warm_concurrency),
-    metadata:          typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
+    metadata: typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
+    // ── FIX: agora repassados ao workflow ────────────────────────────────────
     season_number:     String(season_number),
     episode_number:    String(episode_number),
-    episode_title:     String(episode_title),
-    file_indices:      String(file_indices),
+    episode_title,
+    file_indices,
   };
 
-  const queuePosition = queue.length;
+  try {
+    const r = await triggerWorkflow(account, inputs);
+    if (!r.ok) {
+      const t = await r.text();
+      return res.status(502).json({ error: `GitHub dispatch falhou (${r.status})`, details: t.slice(0,300) });
+    }
 
-  const job = {
-    jobId:        job_id,
-    accountId:    null,
-    accountOwner: null,
-    status:       'queued',
-    createdAt:    new Date().toISOString(),
-    dispatchedAt: null,
-    completedAt:  null,
-    inputs,
-  };
+    account.activeJobs++;
+    account.lastUsed = new Date().toISOString();
 
-  jobStore.set(job_id, job);
-  queue.push(job);
+    jobStore.set(job_id, {
+      jobId:        job_id,
+      accountId:    account.id,
+      accountOwner: account.owner,
+      status:       'dispatched',
+      dispatchedAt: new Date().toISOString(),
+      inputs,
+    });
 
-  console.log(`[QUEUE] job=${job_id} pos=${queuePosition} (queued=${queue.length} running=${running}/${MAX_CONCURRENT})`);
+    console.log(`[DISPATCH] job=${job_id} → ${account.owner} (active=${account.activeJobs}) thumb=${thumbnail_url ? '✓' : '—'}`);
+    res.json({ ok: true, job_id, account: account.owner, account_id: account.id });
 
-  processNext().catch(e => console.error('[processNext unexpected]', e.message));
-
-  res.json({
-    ok:             true,
-    job_id,
-    status:         'queued',
-    queue_position: queuePosition,
-  });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ── POST /webhook ─────────────────────────────────────────────────────────────
+// ── POST /webhook — callback do Actions quando job termina ───────────────────
 app.post('/webhook', async (req, res) => {
   const { job_id, status } = req.body;
   if (!job_id) return res.status(400).json({ error: 'job_id obrigatório' });
 
   const job = jobStore.get(job_id);
   if (!job) return res.status(404).json({ error: 'Job não encontrado' });
-
-  // Se o watchdog já expirou este job, aceitar o webhook mas não decrementar
-  // running de novo (já foi feito pelo watchdog)
-  const wasRunning = job.status === 'dispatched' || job.status === 'dispatching';
 
   job.status      = status || 'done';
   job.completedAt = new Date().toISOString();
@@ -296,78 +203,52 @@ app.post('/webhook', async (req, res) => {
   const account = accounts.find(a => a.id === job.accountId);
   if (account && account.activeJobs > 0) account.activeJobs--;
 
-  if (wasRunning && running > 0) {
-    running--;
-    console.log(`[WEBHOOK] job=${job_id} status=${status} → running=${running}/${MAX_CONCURRENT} queued=${queue.length}`);
-    processNext().catch(e => console.error('[processNext unexpected]', e.message));
-  } else {
-    // Pode ser webhook tardio de job já expirado pelo watchdog — ignorar slot
-    console.log(`[WEBHOOK] job=${job_id} status=${status} (slot já libertado — watchdog ou cancelamento prévio)`);
-  }
-
+  console.log(`[WEBHOOK] job=${job_id} status=${status} conta=${account?.owner}`);
   res.json({ ok: true });
 });
 
-// ── DELETE /jobs/:jobId ───────────────────────────────────────────────────────
+// ── DELETE /jobs/:jobId — cancelar job ───────────────────────────────────────
 app.delete('/jobs/:jobId', auth, async (req, res) => {
   const job = jobStore.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job não encontrado' });
-
-  if (job.status === 'queued') {
-    const idx = queue.indexOf(job);
-    if (idx !== -1) queue.splice(idx, 1);
-    job.status = 'cancelled';
-    console.log(`[CANCEL] job=${job.jobId} removido da fila (queued=${queue.length})`);
-    return res.json({ ok: true, was_queued: true });
-  }
 
   const account = accounts.find(a => a.id === job.accountId);
   if (account && job.runId) {
     try { await cancelRun(account, job.runId); } catch {}
   }
-  if (account && account.activeJobs > 0) account.activeJobs--;
-  if (running > 0) {
-    running--;
-    processNext().catch(e => console.error('[processNext unexpected]', e.message));
-  }
-  job.status = 'cancelled';
 
-  res.json({ ok: true, was_queued: false });
+  job.status = 'cancelled';
+  if (account && account.activeJobs > 0) account.activeJobs--;
+  res.json({ ok: true });
 });
 
-// ── GET /status ───────────────────────────────────────────────────────────────
-app.get('/status', (_, res) => {
+// ── GET /status ──────────────────────────────────────────────────────────────
+app.get('/status', auth, (_, res) => {
   res.json({
-    running,
-    max_concurrent:  MAX_CONCURRENT,
-    queued_jobs:     queue.length,
-    job_ttl_min:     Math.round(JOB_TTL_MS / 60000),
     accounts: accounts.map(a => ({
       id: a.id, owner: a.owner, repo: a.repo,
       activeJobs: a.activeJobs, lastUsed: a.lastUsed,
     })),
-    jobs:  [...jobStore.values()],
-    queue: queue.map((j, i) => ({ job_id: j.jobId, position: i, createdAt: j.createdAt })),
+    jobs: [...jobStore.values()],
   });
 });
 
-// ── GET /health ───────────────────────────────────────────────────────────────
+// ── GET /health ──────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => {
   res.json({
-    ok:             true,
-    accounts:       accounts.length,
-    active_jobs:    running,
-    queued_jobs:    queue.length,
-    max_concurrent: MAX_CONCURRENT,
-    job_ttl_min:    Math.round(JOB_TTL_MS / 60000),
-    workflow:       `${WORKFLOW_FILE}@${WORKFLOW_REF}`,
+    ok: true,
+    accounts: accounts.length,
+    active_jobs: accounts.reduce((s,a) => s + a.activeJobs, 0),
+    workflow: `${WORKFLOW_FILE}@${WORKFLOW_REF}`,
   });
 });
 
-// ── Keep-alive ────────────────────────────────────────────────────────────────
+// ── Keep-alive — evita que o Render (free tier) adormeça ────────────────────
+// Faz self-ping ao /health a cada 14 minutos (Render dorme após 15min idle).
+// FIX: também faz ping à PIPELINE_API para evitar cold start no momento do registo.
 function startKeepAlive(port) {
-  const interval    = 9 * 60 * 1000;  // 9min < 15min sleep do Render free tier
-  const selfUrl     = process.env.RENDER_EXTERNAL_URL
+  const interval  = 14 * 60 * 1000; // 14 minutos
+  const selfUrl   = process.env.RENDER_EXTERNAL_URL
     ? `${process.env.RENDER_EXTERNAL_URL}/health`
     : `http://localhost:${port}/health`;
   const pipelineUrl = process.env.PIPELINE_API
@@ -375,12 +256,17 @@ function startKeepAlive(port) {
     : null;
 
   setInterval(async () => {
+    // Ping ao próprio dispatcher
     try {
       const r = await fetch(selfUrl);
       console.log(`[keep-alive] dispatcher → ${r.status} (${new Date().toISOString()})`);
     } catch (e) {
       console.warn(`[keep-alive] dispatcher ping falhou: ${e.message}`);
     }
+
+    // FIX: Ping à pipeline API para mantê-la acordada e a ligação Turso activa.
+    // Sem isto, após 15min idle o Render adormece e o primeiro registo recebe 500
+    // porque o servidor acorda mas a ligação à BD (Turso/libsql) ainda não está pronta.
     if (pipelineUrl) {
       try {
         const r = await fetch(pipelineUrl, { signal: AbortSignal.timeout(10000) });
@@ -395,14 +281,8 @@ function startKeepAlive(port) {
   if (pipelineUrl) console.log(`  ✓ Keep-alive pipeline → ${pipelineUrl}`);
 }
 
-// ── Init — chamado pelo index.js após o servidor principal fazer listen ────────
-// NÃO chama app.listen() — o dispatcher é montado como sub-router no servidor
-// unificado. O index.js chama dispatcherInit(port) no callback do seu listen.
-function dispatcherInit(port) {
-  console.log(`StreamVault Dispatcher v3.2 (MAX_CONCURRENT=${MAX_CONCURRENT})`);
-  accounts.forEach(a => console.log(`  ✓ Conta ${a.id}: ${a.owner}/${a.repo}`));
-  startKeepAlive(port);
-  startWatchdog();
-}
+// ── Export (para index.js) ────────────────────────────────────────────────────
+console.log(`StreamVault Dispatcher v2.0`);
+accounts.forEach(a => console.log(`  ✓ Conta ${a.id}: ${a.owner}/${a.repo}`));
 
-export { app, accounts, dispatcherInit };
+export { app };
