@@ -21,14 +21,5 @@ if ! nc -z 127.0.0.1 "$APP_PORT" 2>/dev/null; then
 fi
 echo "[start] Porta ${APP_PORT} activa."
 
-if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-  echo "[start] A ligar tunnel cloudflared → http://localhost:${APP_PORT}..."
-  cloudflared tunnel --no-autoupdate run \
-    --token "$CLOUDFLARE_TUNNEL_TOKEN" \
-    --url "http://localhost:${APP_PORT}" &
-  echo "[start] Tunnel iniciado."
-else
-  echo "[start] CLOUDFLARE_TUNNEL_TOKEN não definido — tunnel ignorado"
-fi
 
 wait $NODE_PID
