@@ -7,6 +7,7 @@
 // VARS DE AMBIENTE (.env — mesmo ficheiro do server.js):
 //   DISPATCHER_PORT      — porta do dispatcher (default: 3002)
 //   GH_WORKFLOW_FILE     — nome do workflow (default: process.yml)
+//   GH_UPLOADER_FILE     — nome do workflow uploader (default: uploader.yml)
 //   GH_WORKFLOW_REF      — branch (default: main)
 //
 //   Conta 1:
@@ -22,7 +23,7 @@
 import 'dotenv/config';
 import express from 'express';
 
-const app  = express();
+const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 // ── CORS — permite chamadas do painel admin (pages.dev e domínio próprio) ────
@@ -42,10 +43,11 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT          = parseInt(process.env.PORT || process.env.DISPATCHER_PORT || '3002');
-const WORKFLOW_FILE = process.env.GH_WORKFLOW_FILE || 'process.yml';
-const WORKFLOW_REF  = process.env.GH_WORKFLOW_REF  || 'main';
-const ADMIN_KEY     = process.env.ADMIN_API_KEY    || '';
+const PORT           = parseInt(process.env.PORT || process.env.DISPATCHER_PORT || '3002');
+const WORKFLOW_FILE  = process.env.GH_WORKFLOW_FILE  || 'process.yml';
+const UPLOADER_FILE  = process.env.GH_UPLOADER_FILE  || 'uploader.yml';
+const WORKFLOW_REF   = process.env.GH_WORKFLOW_REF   || 'main';
+const ADMIN_KEY      = process.env.ADMIN_API_KEY     || '';
 
 // ── Carregar contas ──────────────────────────────────────────────────────────
 function loadAccounts() {
@@ -92,9 +94,36 @@ function ghFetch(url, token, opts = {}) {
   });
 }
 
+/**
+ * Detecta se o job é um uploader baseado nos inputs.
+ * Uploaders têm: video_url vazio + metadata.is_uploader = true
+ * OU file_indices começando com "uploader:"
+ */
+function isUploaderJob(inputs) {
+  // Método 1: metadata contém flag is_uploader
+  try {
+    const meta = typeof inputs.metadata === 'string'
+      ? JSON.parse(inputs.metadata)
+      : inputs.metadata;
+    if (meta?.is_uploader === true) return true;
+  } catch {}
+
+  // Método 2: video_url vazio + file_indices = uploader:N
+  if (!inputs.video_url && typeof inputs.file_indices === 'string' && inputs.file_indices.startsWith('uploader:')) {
+    return true;
+  }
+
+  return false;
+}
+
 async function triggerWorkflow(account, inputs) {
+  // Seleciona o workflow correto baseado no tipo de job
+  const workflowFile = isUploaderJob(inputs) ? UPLOADER_FILE : WORKFLOW_FILE;
+
+  console.log(`[DISPATCH] job=${inputs.job_id} → workflow=${workflowFile} conta=${account.owner}`);
+
   return ghFetch(
-    `https://api.github.com/repos/${account.owner}/${account.repo}/actions/workflows/${WORKFLOW_FILE}/dispatches`,
+    `https://api.github.com/repos/${account.owner}/${account.repo}/actions/workflows/${workflowFile}/dispatches`,
     account.token,
     {
       method:  'POST',
@@ -115,6 +144,18 @@ async function cancelRun(account, runId) {
 // ── Job store ────────────────────────────────────────────────────────────────
 const jobStore = new Map();
 
+// Limpeza periódica de jobs antigos (mais de 24h)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobStore) {
+    const dispatchedAt = job.dispatchedAt ? new Date(job.dispatchedAt).getTime() : 0;
+    if (now - dispatchedAt > 24 * 60 * 60 * 1000) {
+      jobStore.delete(id);
+      console.log(`[CLEANUP] Job expirado removido: ${id}`);
+    }
+  }
+}, 60 * 60 * 1000); // A cada hora
+
 // ── Auth middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
   if (!ADMIN_KEY) return next();
@@ -124,7 +165,6 @@ function auth(req, res, next) {
 }
 
 // ── POST /dispatch ───────────────────────────────────────────────────────────
-// FIX: thumbnail_url adicionado ao destructuring e aos inputs do workflow.
 app.post('/dispatch', auth, async (req, res) => {
   const {
     job_id,
@@ -134,8 +174,6 @@ app.post('/dispatch', auth, async (req, res) => {
     max_encode_height = '720',
     warm_concurrency  = '8',
     metadata          = {},
-    // ── FIX: campos de série/anime/dorama estavam ausentes — o coordinator
-    // no process.yml depende de season_number para rotular os jobs filhos.
     season_number     = '0',
     episode_number    = '0',
     episode_title     = '',
@@ -143,7 +181,23 @@ app.post('/dispatch', auth, async (req, res) => {
   } = req.body;
 
   if (!job_id) return res.status(400).json({ error: 'job_id obrigatório' });
-  if (jobStore.has(job_id)) return res.status(409).json({ error: 'Job já existe' });
+
+  // Verificar se job já existe e ainda está ativo
+  if (jobStore.has(job_id)) {
+    const existing = jobStore.get(job_id);
+    const isActive = existing.status === 'dispatched' || existing.status === 'running';
+    if (isActive) {
+      return res.status(409).json({
+        error: 'Job já existe e está ativo',
+        job_id,
+        status: existing.status,
+        dispatchedAt: existing.dispatchedAt,
+      });
+    }
+    // Se job anterior falhou/completou, permite re-disparar
+    console.log(`[DISPATCH] Job ${job_id} re-disparado (status anterior: ${existing.status})`);
+    jobStore.delete(job_id);
+  }
 
   const account = selectAccount();
 
@@ -155,7 +209,6 @@ app.post('/dispatch', auth, async (req, res) => {
     max_encode_height: String(max_encode_height),
     warm_concurrency:  String(warm_concurrency),
     metadata: typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
-    // ── FIX: agora repassados ao workflow ────────────────────────────────────
     season_number:     String(season_number),
     episode_number:    String(episode_number),
     episode_title,
@@ -164,13 +217,20 @@ app.post('/dispatch', auth, async (req, res) => {
 
   try {
     const r = await triggerWorkflow(account, inputs);
+
     if (!r.ok) {
       const t = await r.text();
-      return res.status(502).json({ error: `GitHub dispatch falhou (${r.status})`, details: t.slice(0,300) });
+      console.error(`[DISPATCH] GitHub API error ${r.status}: ${t.slice(0, 300)}`);
+      return res.status(502).json({
+        error: `GitHub dispatch falhou (${r.status})`,
+        details: t.slice(0, 300),
+      });
     }
 
     account.activeJobs++;
     account.lastUsed = new Date().toISOString();
+
+    const isUploader = isUploaderJob(inputs);
 
     jobStore.set(job_id, {
       jobId:        job_id,
@@ -178,33 +238,72 @@ app.post('/dispatch', auth, async (req, res) => {
       accountOwner: account.owner,
       status:       'dispatched',
       dispatchedAt: new Date().toISOString(),
+      isUploader,
       inputs,
     });
 
-    console.log(`[DISPATCH] job=${job_id} → ${account.owner} (active=${account.activeJobs}) thumb=${thumbnail_url ? '✓' : '—'}`);
-    res.json({ ok: true, job_id, account: account.owner, account_id: account.id });
+    console.log(`[DISPATCH] ✓ job=${job_id} → ${account.owner}/${account.repo} (active=${account.activeJobs}) uploader=${isUploader} thumb=${thumbnail_url ? '✓' : '—'}`);
+
+    res.json({
+      ok: true,
+      job_id,
+      account: account.owner,
+      account_id: account.id,
+      is_uploader: isUploader,
+      workflow: isUploader ? UPLOADER_FILE : WORKFLOW_FILE,
+    });
 
   } catch (e) {
+    console.error(`[DISPATCH] Erro: ${e.message}`);
     res.status(500).json({ error: e.message });
   }
 });
 
 // ── POST /webhook — callback do Actions quando job termina ───────────────────
 app.post('/webhook', async (req, res) => {
-  const { job_id, status } = req.body;
+  const { job_id, status, parent_job } = req.body;
+
   if (!job_id) return res.status(400).json({ error: 'job_id obrigatório' });
 
   const job = jobStore.get(job_id);
-  if (!job) return res.status(404).json({ error: 'Job não encontrado' });
+
+  if (!job) {
+    // Pode ser um uploader filho que não estava no jobStore
+    console.log(`[WEBHOOK] Job ${job_id} não encontrado no store (uploader filho?)`);
+    return res.status(404).json({ error: 'Job não encontrado', job_id });
+  }
 
   job.status      = status || 'done';
   job.completedAt = new Date().toISOString();
   job.result      = req.body;
 
   const account = accounts.find(a => a.id === job.accountId);
-  if (account && account.activeJobs > 0) account.activeJobs--;
+  if (account && account.activeJobs > 0) {
+    account.activeJobs--;
+  }
 
-  console.log(`[WEBHOOK] job=${job_id} status=${status} conta=${account?.owner}`);
+  // Se for uploader, também atualiza o contador do job pai
+  if (parent_job && jobStore.has(parent_job)) {
+    const parent = jobStore.get(parent_job);
+    if (!parent.uploaderResults) parent.uploaderResults = {};
+    parent.uploaderResults[job_id] = status || 'done';
+
+    // Verificar se todos os uploaders terminaram
+    const totalUploaders = parent.inputs?.metadata
+      ? (() => {
+          try {
+            const m = JSON.parse(parent.inputs.metadata);
+            return m.batch_count || 0;
+          } catch { return 0; }
+        })()
+      : 0;
+
+    const completedUploaders = Object.values(parent.uploaderResults).filter(s => s === 'done').length;
+
+    console.log(`[WEBHOOK] Uploader ${job_id} → ${status} (parent: ${parent_job} ${completedUploaders}/${totalUploaders})`);
+  }
+
+  console.log(`[WEBHOOK] job=${job_id} status=${status} conta=${account?.owner} active=${account?.activeJobs}`);
   res.json({ ok: true });
 });
 
@@ -215,22 +314,47 @@ app.delete('/jobs/:jobId', auth, async (req, res) => {
 
   const account = accounts.find(a => a.id === job.accountId);
   if (account && job.runId) {
-    try { await cancelRun(account, job.runId); } catch {}
+    try {
+      await cancelRun(account, job.runId);
+      console.log(`[CANCEL] Run ${job.runId} cancelado`);
+    } catch (e) {
+      console.warn(`[CANCEL] Erro ao cancelar run: ${e.message}`);
+    }
   }
 
   job.status = 'cancelled';
   if (account && account.activeJobs > 0) account.activeJobs--;
-  res.json({ ok: true });
+  res.json({ ok: true, job_id: req.params.jobId });
 });
 
 // ── GET /status ──────────────────────────────────────────────────────────────
 app.get('/status', auth, (_, res) => {
+  const jobs = [...jobStore.values()].map(j => ({
+    jobId: j.jobId,
+    status: j.status,
+    accountOwner: j.accountOwner,
+    isUploader: j.isUploader || false,
+    dispatchedAt: j.dispatchedAt,
+    completedAt: j.completedAt || null,
+    uploaderResults: j.uploaderResults || null,
+  }));
+
   res.json({
     accounts: accounts.map(a => ({
-      id: a.id, owner: a.owner, repo: a.repo,
-      activeJobs: a.activeJobs, lastUsed: a.lastUsed,
+      id: a.id,
+      owner: a.owner,
+      repo: a.repo,
+      activeJobs: a.activeJobs,
+      lastUsed: a.lastUsed,
     })),
-    jobs: [...jobStore.values()],
+    jobs,
+    total_active: accounts.reduce((s, a) => s + a.activeJobs, 0),
+    total_jobs: jobStore.size,
+    workflows: {
+      process: WORKFLOW_FILE,
+      uploader: UPLOADER_FILE,
+      ref: WORKFLOW_REF,
+    },
   });
 });
 
@@ -239,14 +363,15 @@ app.get('/health', (_, res) => {
   res.json({
     ok: true,
     accounts: accounts.length,
-    active_jobs: accounts.reduce((s,a) => s + a.activeJobs, 0),
+    active_jobs: accounts.reduce((s, a) => s + a.activeJobs, 0),
     workflow: `${WORKFLOW_FILE}@${WORKFLOW_REF}`,
+    uploader: `${UPLOADER_FILE}@${WORKFLOW_REF}`,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
   });
 });
 
 // ── Keep-alive — evita que o Render (free tier) adormeça ────────────────────
-// Faz self-ping ao /health a cada 14 minutos (Render dorme após 15min idle).
-// FIX: também faz ping à PIPELINE_API para evitar cold start no momento do registo.
 function startKeepAlive(port) {
   const interval  = 14 * 60 * 1000; // 14 minutos
   const selfUrl   = process.env.RENDER_EXTERNAL_URL
@@ -257,17 +382,13 @@ function startKeepAlive(port) {
     : null;
 
   setInterval(async () => {
-    // Ping ao próprio dispatcher
     try {
-      const r = await fetch(selfUrl);
+      const r = await fetch(selfUrl, { signal: AbortSignal.timeout(10000) });
       console.log(`[keep-alive] dispatcher → ${r.status} (${new Date().toISOString()})`);
     } catch (e) {
       console.warn(`[keep-alive] dispatcher ping falhou: ${e.message}`);
     }
 
-    // FIX: Ping à pipeline API para mantê-la acordada e a ligação Turso activa.
-    // Sem isto, após 15min idle o Render adormece e o primeiro registo recebe 500
-    // porque o servidor acorda mas a ligação à BD (Turso/libsql) ainda não está pronta.
     if (pipelineUrl) {
       try {
         const r = await fetch(pipelineUrl, { signal: AbortSignal.timeout(10000) });
@@ -282,8 +403,21 @@ function startKeepAlive(port) {
   if (pipelineUrl) console.log(`  ✓ Keep-alive pipeline → ${pipelineUrl}`);
 }
 
-// ── Export (para index.js) ────────────────────────────────────────────────────
+// ── Start ────────────────────────────────────────────────────────────────────
 console.log(`StreamVault Dispatcher v2.0`);
-accounts.forEach(a => console.log(`  ✓ Conta ${a.id}: ${a.owner}/${a.repo}`));
+console.log(`  Accounts: ${accounts.length}`);
+accounts.forEach(a => console.log(`    ${a.id}: ${a.owner}/${a.repo}`));
+console.log(`  Workflows:`);
+console.log(`    Process:  ${WORKFLOW_FILE}@${WORKFLOW_REF}`);
+console.log(`    Uploader: ${UPLOADER_FILE}@${WORKFLOW_REF}`);
 
+// Export para uso com index.js (servidor unificado)
 export { app };
+
+// Start standalone se executado diretamente
+if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^.*[\\/]/, ''))) {
+  app.listen(PORT, () => {
+    console.log(`\n  ✓ Dispatcher running on http://localhost:${PORT}`);
+    startKeepAlive(PORT);
+  });
+}
