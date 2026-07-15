@@ -1,13 +1,33 @@
-// dispatcher.js – StreamVault Dispatcher v2.0
+// dispatcher.js – StreamVault Dispatcher v2.1
 //
 // Gere 2 contas GitHub Actions em round-robin.
 // Substitui apenas o processQueue/processJob do server.js —
 // todas as rotas e lógica do server.js ficam intactas.
 //
+// FIX v2.1:
+//   • Removido `warm_concurrency` do payload de /dispatch. O process.yml
+//     deixou de declarar esse input (o step de aquecimento de cache do
+//     Worker foi removido — storage passou a ser servido directamente por
+//     raw.githubusercontent.com, sem CDN/Worker no caminho). A API de
+//     workflow_dispatch do GitHub rejeita com 422 "Unexpected inputs
+//     provided" quando o payload contém uma chave que o workflow não
+//     declara — todo dispatch estava a falhar por causa deste único campo.
+//   • Novo endpoint POST /shard-delete: dispara shard-delete.yml (mesmo
+//     mecanismo de round-robin do /dispatch) para remover um job_id de um
+//     shard de storage. Chamado pelo backend EdgeOne (lib/edgeone.js,
+//     deleteContent) via DISPATCHER_URL + ADMIN_API_KEY — o EdgeOne nunca
+//     fala directamente com a API do GitHub, só este serviço tem as contas.
+//   • REQUISITO DE DEPLOY: shard-delete.yml precisa de existir no repo de
+//     AMBAS as contas (GH_ACCOUNT_1_REPO e GH_ACCOUNT_2_REPO), com o secret
+//     STORAGE_GITHUB_TOKEN/STORAGE_GITHUB_OWNER configurado em cada uma —
+//     porque o round-robin pode escolher qualquer uma das duas para correr
+//     o delete, independentemente de qual conta processou o job original.
+//
 // VARS DE AMBIENTE (.env — mesmo ficheiro do server.js):
 //   DISPATCHER_PORT      — porta do dispatcher (default: 3002)
 //   GH_WORKFLOW_FILE     — nome do workflow (default: process.yml)
 //   GH_UPLOADER_FILE     — nome do workflow uploader (default: uploader.yml)
+//   GH_SHARD_DELETE_FILE — nome do workflow de shard delete (default: shard-delete.yml)
 //   GH_WORKFLOW_REF      — branch (default: main)
 //
 //   Conta 1:
@@ -43,11 +63,12 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT           = parseInt(process.env.PORT || process.env.DISPATCHER_PORT || '3002');
-const WORKFLOW_FILE  = process.env.GH_WORKFLOW_FILE  || 'process.yml';
-const UPLOADER_FILE  = process.env.GH_UPLOADER_FILE  || 'uploader.yml';
-const WORKFLOW_REF   = process.env.GH_WORKFLOW_REF   || 'main';
-const ADMIN_KEY      = process.env.ADMIN_API_KEY     || '';
+const PORT              = parseInt(process.env.PORT || process.env.DISPATCHER_PORT || '3002');
+const WORKFLOW_FILE     = process.env.GH_WORKFLOW_FILE     || 'process.yml';
+const UPLOADER_FILE     = process.env.GH_UPLOADER_FILE     || 'uploader.yml';
+const SHARD_DELETE_FILE = process.env.GH_SHARD_DELETE_FILE || 'shard-delete.yml';
+const WORKFLOW_REF      = process.env.GH_WORKFLOW_REF      || 'main';
+const ADMIN_KEY         = process.env.ADMIN_API_KEY        || '';
 
 // ── Carregar contas ──────────────────────────────────────────────────────────
 function loadAccounts() {
@@ -88,7 +109,7 @@ function ghFetch(url, token, opts = {}) {
       'Authorization':        `Bearer ${token}`,
       'Accept':               'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent':           'StreamVault-Dispatcher/2.0',
+      'User-Agent':           'StreamVault-Dispatcher/2.1',
       ...(opts.headers || {}),
     },
   });
@@ -116,10 +137,7 @@ function isUploaderJob(inputs) {
   return false;
 }
 
-async function triggerWorkflow(account, inputs) {
-  // Seleciona o workflow correto baseado no tipo de job
-  const workflowFile = isUploaderJob(inputs) ? UPLOADER_FILE : WORKFLOW_FILE;
-
+async function triggerWorkflow(account, workflowFile, inputs) {
   console.log(`[DISPATCH] job=${inputs.job_id} → workflow=${workflowFile} conta=${account.owner}`);
 
   return ghFetch(
@@ -172,7 +190,6 @@ app.post('/dispatch', auth, async (req, res) => {
     thumbnail_url     = '',
     seg_duration      = '4',
     max_encode_height = '720',
-    warm_concurrency  = '8',
     metadata          = {},
     season_number     = '0',
     episode_number    = '0',
@@ -207,7 +224,6 @@ app.post('/dispatch', auth, async (req, res) => {
     thumbnail_url,
     seg_duration:      String(seg_duration),
     max_encode_height: String(max_encode_height),
-    warm_concurrency:  String(warm_concurrency),
     metadata: typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
     season_number:     String(season_number),
     episode_number:    String(episode_number),
@@ -215,8 +231,12 @@ app.post('/dispatch', auth, async (req, res) => {
     file_indices,
   };
 
+  // Seleciona o workflow correto baseado no tipo de job
+  const isUploader   = isUploaderJob(inputs);
+  const workflowFile = isUploader ? UPLOADER_FILE : WORKFLOW_FILE;
+
   try {
-    const r = await triggerWorkflow(account, inputs);
+    const r = await triggerWorkflow(account, workflowFile, inputs);
 
     if (!r.ok) {
       const t = await r.text();
@@ -229,8 +249,6 @@ app.post('/dispatch', auth, async (req, res) => {
 
     account.activeJobs++;
     account.lastUsed = new Date().toISOString();
-
-    const isUploader = isUploaderJob(inputs);
 
     jobStore.set(job_id, {
       jobId:        job_id,
@@ -250,11 +268,48 @@ app.post('/dispatch', auth, async (req, res) => {
       account: account.owner,
       account_id: account.id,
       is_uploader: isUploader,
-      workflow: isUploader ? UPLOADER_FILE : WORKFLOW_FILE,
+      workflow: workflowFile,
     });
 
   } catch (e) {
     console.error(`[DISPATCH] Erro: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /shard-delete ────────────────────────────────────────────────────────
+// Chamado pelo backend EdgeOne (lib/edgeone.js → deleteContent) quando um
+// conteúdo é apagado do catálogo. Dispara shard-delete.yml numa das 2 contas
+// (round-robin, igual ao /dispatch) — não importa qual das duas corre o
+// workflow, já que ele autentica no shard de storage via STORAGE_GITHUB_TOKEN
+// (secret configurado no repo da conta, independente de qual das duas é).
+app.post('/shard-delete', auth, async (req, res) => {
+  const { job_id, shard_repo } = req.body;
+
+  if (!job_id || !shard_repo) {
+    return res.status(400).json({ error: 'job_id e shard_repo são obrigatórios' });
+  }
+
+  const account = selectAccount();
+  const inputs  = { job_id, shard_repo };
+
+  try {
+    const r = await triggerWorkflow(account, SHARD_DELETE_FILE, inputs);
+
+    if (!r.ok) {
+      const t = await r.text();
+      console.error(`[SHARD-DELETE] GitHub API error ${r.status}: ${t.slice(0, 300)}`);
+      return res.status(502).json({
+        error: `GitHub dispatch falhou (${r.status})`,
+        details: t.slice(0, 300),
+      });
+    }
+
+    console.log(`[SHARD-DELETE] ✓ job_id=${job_id} shard=${shard_repo} → conta=${account.owner}`);
+    res.json({ ok: true, job_id, shard_repo, account: account.owner });
+
+  } catch (e) {
+    console.error(`[SHARD-DELETE] Erro: ${e.message}`);
     res.status(500).json({ error: e.message });
   }
 });
@@ -353,6 +408,7 @@ app.get('/status', auth, (_, res) => {
     workflows: {
       process: WORKFLOW_FILE,
       uploader: UPLOADER_FILE,
+      shard_delete: SHARD_DELETE_FILE,
       ref: WORKFLOW_REF,
     },
   });
@@ -366,6 +422,7 @@ app.get('/health', (_, res) => {
     active_jobs: accounts.reduce((s, a) => s + a.activeJobs, 0),
     workflow: `${WORKFLOW_FILE}@${WORKFLOW_REF}`,
     uploader: `${UPLOADER_FILE}@${WORKFLOW_REF}`,
+    shard_delete: `${SHARD_DELETE_FILE}@${WORKFLOW_REF}`,
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
   });
@@ -404,12 +461,13 @@ function startKeepAlive(port) {
 }
 
 // ── Start ────────────────────────────────────────────────────────────────────
-console.log(`StreamVault Dispatcher v2.0`);
+console.log(`StreamVault Dispatcher v2.1`);
 console.log(`  Accounts: ${accounts.length}`);
 accounts.forEach(a => console.log(`    ${a.id}: ${a.owner}/${a.repo}`));
 console.log(`  Workflows:`);
-console.log(`    Process:  ${WORKFLOW_FILE}@${WORKFLOW_REF}`);
-console.log(`    Uploader: ${UPLOADER_FILE}@${WORKFLOW_REF}`);
+console.log(`    Process:      ${WORKFLOW_FILE}@${WORKFLOW_REF}`);
+console.log(`    Uploader:     ${UPLOADER_FILE}@${WORKFLOW_REF}`);
+console.log(`    Shard Delete: ${SHARD_DELETE_FILE}@${WORKFLOW_REF}`);
 
 // Export para uso com index.js (servidor unificado)
 export { app };
