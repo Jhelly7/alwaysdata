@@ -23,6 +23,14 @@
 //     porque o round-robin pode escolher qualquer uma das duas para correr
 //     o delete, independentemente de qual conta processou o job original.
 //
+// FIX v2.2:
+//   • Adicionada a origem do worker que serve o ingest.html
+//     (streamvault-ingest, ver cold-brook-4c20.sheltonnaem.workers.dev)
+//     à lista de CORS. Sem isso, o browser bloqueava GET /health e
+//     GET /status com CORS error, e o front-end ficava preso no loop
+//     de retry ("a acordar...") achando que o Render estava a dormir —
+//     quando na verdade a resposta nem chegava a ser lida pelo browser.
+//
 // VARS DE AMBIENTE (.env — mesmo ficheiro do server.js):
 //   DISPATCHER_PORT      — porta do dispatcher (default: 3002)
 //   GH_WORKFLOW_FILE     — nome do workflow (default: process.yml)
@@ -46,12 +54,14 @@ import express from 'express';
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// ── CORS — permite chamadas do painel admin (pages.dev e domínio próprio) ────
+// ── CORS — permite chamadas do painel admin (pages.dev, worker de ingest
+// e domínio próprio) ─────────────────────────────────────────────────────
 app.use((req, res, next) => {
   const allowed = [
     'https://streamvault-admin.pages.dev',
     'https://pixgo.qzz.io',
     'https://digital.pixgo.frii.site',
+    'https://cold-brook-4c20.sheltonnaem.workers.dev',
   ];
   const origin = req.headers.origin || '';
   if (allowed.includes(origin) || !origin) {
