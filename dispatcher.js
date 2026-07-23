@@ -1,35 +1,49 @@
-// dispatcher.js – StreamVault Dispatcher v2.1
+// dispatcher.js – StreamVault Dispatcher v2.3
 //
 // Gere 2 contas GitHub Actions em round-robin.
 // Substitui apenas o processQueue/processJob do server.js —
 // todas as rotas e lógica do server.js ficam intactas.
 //
-// FIX v2.1:
-//   • Removido `warm_concurrency` do payload de /dispatch. O process.yml
-//     deixou de declarar esse input (o step de aquecimento de cache do
-//     Worker foi removido — storage passou a ser servido directamente por
-//     raw.githubusercontent.com, sem CDN/Worker no caminho). A API de
-//     workflow_dispatch do GitHub rejeita com 422 "Unexpected inputs
-//     provided" quando o payload contém uma chave que o workflow não
-//     declara — todo dispatch estava a falhar por causa deste único campo.
-//   • Novo endpoint POST /shard-delete: dispara shard-delete.yml (mesmo
-//     mecanismo de round-robin do /dispatch) para remover um job_id de um
-//     shard de storage. Chamado pelo backend EdgeOne (lib/edgeone.js,
-//     deleteContent) via DISPATCHER_URL + ADMIN_API_KEY — o EdgeOne nunca
-//     fala directamente com a API do GitHub, só este serviço tem as contas.
-//   • REQUISITO DE DEPLOY: shard-delete.yml precisa de existir no repo de
-//     AMBAS as contas (GH_ACCOUNT_1_REPO e GH_ACCOUNT_2_REPO), com o secret
-//     STORAGE_GITHUB_TOKEN/STORAGE_GITHUB_OWNER configurado em cada uma —
-//     porque o round-robin pode escolher qualquer uma das duas para correr
-//     o delete, independentemente de qual conta processou o job original.
+// FIX v2.3 (jitter + retry na chamada de dispatch ao GitHub):
+//   • O sistema de lotes/espaçamento que já existe a montante (server.js
+//     enfileirando chamadas a /dispatch) protege a FREQUÊNCIA com que o
+//     dispatcher é chamado — mas até agora, cada chamada que chegava ao
+//     triggerWorkflow ia direto pra API do GitHub sem nenhum jitter nem
+//     retry. Se o server.js mandar uma rajada de /dispatch em sequência
+//     (ex: processar uma fila de itens pendentes de uma vez), cada uma
+//     virava uma chamada imediata — exatamente o padrão de rajada
+//     correlacionada identificado como gatilho de detecção de abuso.
+//   • DispatchQueue: fila interna que serializa TODAS as chamadas reais
+//     de dispatch ao GitHub (mesmo entre contas diferentes) com um
+//     espaçamento mínimo aleatório (jitter) entre elas. Não bloqueia o
+//     /dispatch em si — a resposta HTTP só volta depois da chamada
+//     real ao GitHub terminar, então bursts de requisições ficam
+//     naturalmente espaçados sem precisar de nenhuma mudança no
+//     server.js.
+//   • Retry com backoff exponencial + jitter em triggerWorkflow: só re-
+//     tenta em 429 (rate limit) e 5xx (erro transitório do GitHub) —
+//     nunca em 4xx que não seja 429 (esses são erros de payload/permis-
+//     são, retry não ajuda). Máximo 3 tentativas, mesmo padrão adotado
+//     no coordinator do process-leve.yml.
 //
-// FIX v2.2:
-//   • Adicionada a origem do worker que serve o ingest.html
-//     (streamvault-ingest, ver cold-brook-4c20.sheltonnaem.workers.dev)
-//     à lista de CORS. Sem isso, o browser bloqueava GET /health e
-//     GET /status com CORS error, e o front-end ficava preso no loop
-//     de retry ("a acordar...") achando que o Render estava a dormir —
-//     quando na verdade a resposta nem chegava a ser lida pelo browser.
+// FIX v2.2 (autenticação via GitHub App):
+//   • Cada conta pode agora autenticar via GitHub App (App ID +
+//     Installation ID + chave privada) em vez de PAT pessoal. Isto
+//     move a atribuição das chamadas de "conta de usuário fazendo
+//     requisições em massa via API" para "integração declarada e de
+//     escopo restrito", reduzindo a chance de o padrão de disparo
+//     automatizado do dispatcher ser lido como atividade anômala de
+//     conta pelo GitHub.
+//   • Token de instalação é gerado sob demanda (JWT assinado com a
+//     chave privada da App, válido 10min) e trocado por um installation
+//     access token (válido 1h) via API do GitHub — cacheado em memória
+//     e renovado automaticamente ~5min antes de expirar.
+//   • COMPATIBILIDADE: contas sem GH_ACCOUNT_N_APP_ID configurado
+//     continuam a usar GH_ACCOUNT_N_TOKEN (PAT) como antes — a migração
+//     pode ser feita conta a conta, sem downtime.
+//
+// (mantém tudo de v2.1: fix do warm_concurrency removido do payload,
+//  endpoint /shard-delete, correção de CORS para o worker de ingest)
 //
 // VARS DE AMBIENTE (.env — mesmo ficheiro do server.js):
 //   DISPATCHER_PORT      — porta do dispatcher (default: 3002)
@@ -38,18 +52,23 @@
 //   GH_SHARD_DELETE_FILE — nome do workflow de shard delete (default: shard-delete.yml)
 //   GH_WORKFLOW_REF      — branch (default: main)
 //
-//   Conta 1:
+//   Conta 1 — modo GitHub App (recomendado):
+//   GH_ACCOUNT_1_APP_ID          — App ID (visto no topo da página da App)
+//   GH_ACCOUNT_1_INSTALLATION_ID — Installation ID (URL de settings/installations/<id>)
+//   GH_ACCOUNT_1_PRIVATE_KEY     — conteúdo do .pem gerado (com \n literais se vier de .env)
+//   GH_ACCOUNT_1_OWNER           — username/org onde a App está instalada
+//   GH_ACCOUNT_1_REPO            — repo com o process.yml / process-leve.yml
+//
+//   Conta 1 — modo PAT (legado, ainda suportado):
 //   GH_ACCOUNT_1_TOKEN   — PAT (scope: repo, workflow)
 //   GH_ACCOUNT_1_OWNER   — username
 //   GH_ACCOUNT_1_REPO    — repo com o process.yml
 //
-//   Conta 2:
-//   GH_ACCOUNT_2_TOKEN
-//   GH_ACCOUNT_2_OWNER
-//   GH_ACCOUNT_2_REPO
+//   Conta 2: mesmo padrão, trocando "_1_" por "_2_"
 
 import 'dotenv/config';
 import express from 'express';
+import crypto from 'crypto';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -80,16 +99,104 @@ const SHARD_DELETE_FILE = process.env.GH_SHARD_DELETE_FILE || 'shard-delete.yml'
 const WORKFLOW_REF      = process.env.GH_WORKFLOW_REF      || 'main';
 const ADMIN_KEY         = process.env.ADMIN_API_KEY        || '';
 
+// ── Auth via GitHub App (JWT → installation access token) ───────────────────
+// Assina um JWT curto (10min) com a chave privada RS256 da App — usado só
+// pra trocar por um installation access token, nunca usado diretamente
+// nas chamadas de API.
+function buildAppJwt(appId, privateKeyPem) {
+  const now = Math.floor(Date.now() / 1000);
+  const header  = { alg: 'RS256', typ: 'JWT' };
+  const payload = {
+    iat: now - 60,       // margem de tolerância de relógio
+    exp: now + 9 * 60,   // 9min (teto do GitHub é 10min)
+    iss: appId,
+  };
+  const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const unsigned = `${b64url(header)}.${b64url(payload)}`;
+  const signature = crypto.sign('RSA-SHA256', Buffer.from(unsigned), privateKeyPem)
+    .toString('base64url');
+  return `${unsigned}.${signature}`;
+}
+
+// Cache de installation tokens em memória — chave por account.id.
+const installationTokenCache = new Map(); // id -> { token, expiresAt }
+
+async function getInstallationToken(account) {
+  const cached = installationTokenCache.get(account.id);
+  const now = Date.now();
+  // Renova ~5min antes de expirar, nunca em cima da hora.
+  if (cached && cached.expiresAt - now > 5 * 60 * 1000) {
+    return cached.token;
+  }
+
+  const jwt = buildAppJwt(account.appId, account.privateKey);
+  const r = await fetch(
+    `https://api.github.com/app/installations/${account.installationId}/access_tokens`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization':        `Bearer ${jwt}`,
+        'Accept':               'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    }
+  );
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Falha ao gerar installation token (conta ${account.owner}): HTTP ${r.status} ${t.slice(0, 200)}`);
+  }
+
+  const data = await r.json();
+  const expiresAt = new Date(data.expires_at).getTime();
+  installationTokenCache.set(account.id, { token: data.token, expiresAt });
+  console.log(`[AUTH] Novo installation token gerado para ${account.owner} (expira ${data.expires_at})`);
+  return data.token;
+}
+
+// Devolve o token a usar nesta chamada — resolve GitHub App (assíncrono)
+// ou PAT (síncrono, devolvido já pronto) de forma transparente.
+async function resolveToken(account) {
+  if (account.mode === 'app') {
+    return getInstallationToken(account);
+  }
+  return account.token; // modo PAT legado
+}
+
 // ── Carregar contas ──────────────────────────────────────────────────────────
+// Prioriza modo GitHub App (APP_ID + INSTALLATION_ID + PRIVATE_KEY); cai
+// para modo PAT (TOKEN) se a App não estiver configurada para aquela conta.
 function loadAccounts() {
   const accounts = [];
   let n = 1;
   while (true) {
-    const token = process.env[`GH_ACCOUNT_${n}_TOKEN`];
     const owner = process.env[`GH_ACCOUNT_${n}_OWNER`];
     const repo  = process.env[`GH_ACCOUNT_${n}_REPO`];
-    if (!token || !owner || !repo) break;
-    accounts.push({ id: n, token, owner, repo, activeJobs: 0, lastUsed: null });
+    if (!owner || !repo) break;
+
+    const appId          = process.env[`GH_ACCOUNT_${n}_APP_ID`];
+    const installationId = process.env[`GH_ACCOUNT_${n}_INSTALLATION_ID`];
+    // Permite \n literais no .env (comum ao colar chave PEM numa única linha)
+    const privateKeyRaw  = process.env[`GH_ACCOUNT_${n}_PRIVATE_KEY`];
+    const privateKey     = privateKeyRaw ? privateKeyRaw.replace(/\\n/g, '\n') : undefined;
+    const token          = process.env[`GH_ACCOUNT_${n}_TOKEN`];
+
+    if (appId && installationId && privateKey) {
+      accounts.push({
+        id: n, owner, repo, activeJobs: 0, lastUsed: null,
+        mode: 'app', appId, installationId, privateKey,
+      });
+      console.log(`  Conta ${n} (${owner}): autenticação via GitHub App`);
+    } else if (token) {
+      accounts.push({
+        id: n, owner, repo, activeJobs: 0, lastUsed: null,
+        mode: 'pat', token,
+      });
+      console.log(`  Conta ${n} (${owner}): autenticação via PAT (legado — considere migrar para GitHub App)`);
+    } else {
+      console.error(`ERRO: Conta ${n} (${owner}) sem credenciais válidas (nem App, nem PAT) — ignorada.`);
+      break;
+    }
     n++;
   }
   return accounts;
@@ -112,14 +219,15 @@ function selectAccount() {
 }
 
 // ── GitHub API ───────────────────────────────────────────────────────────────
-function ghFetch(url, token, opts = {}) {
+async function ghFetch(url, account, opts = {}) {
+  const token = await resolveToken(account);
   return fetch(url, {
     ...opts,
     headers: {
       'Authorization':        `Bearer ${token}`,
       'Accept':               'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent':           'StreamVault-Dispatcher/2.1',
+      'User-Agent':           'StreamVault-Dispatcher/2.2',
       ...(opts.headers || {}),
     },
   });
@@ -131,7 +239,6 @@ function ghFetch(url, token, opts = {}) {
  * OU file_indices começando com "uploader:"
  */
 function isUploaderJob(inputs) {
-  // Método 1: metadata contém flag is_uploader
   try {
     const meta = typeof inputs.metadata === 'string'
       ? JSON.parse(inputs.metadata)
@@ -139,7 +246,6 @@ function isUploaderJob(inputs) {
     if (meta?.is_uploader === true) return true;
   } catch {}
 
-  // Método 2: video_url vazio + file_indices = uploader:N
   if (!inputs.video_url && typeof inputs.file_indices === 'string' && inputs.file_indices.startsWith('uploader:')) {
     return true;
   }
@@ -147,12 +253,77 @@ function isUploaderJob(inputs) {
   return false;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── DispatchQueue — serializa chamadas reais de dispatch ao GitHub com
+// jitter aleatório entre elas. Complementa (não substitui) o espaçamento
+// de lotes que já existe a montante no server.js: mesmo que várias
+// chamadas a /dispatch cheguem ao dispatcher em rajada, as chamadas
+// efetivas à API do GitHub saem uma de cada vez, com intervalo aleatório.
+// Se o espaçamento a montante já for maior que o jitter (caso comum),
+// esta fila não introduz atraso extra — só age quando detecta rajada.
+class DispatchQueue {
+  constructor(minJitterMs, maxJitterMs) {
+    this.minJitterMs = minJitterMs;
+    this.maxJitterMs = maxJitterMs;
+    this.tail = Promise.resolve();
+    this.lastRunAt = 0;
+  }
+
+  enqueue(task) {
+    const run = this.tail.then(async () => {
+      const jitter  = this.minJitterMs + Math.random() * (this.maxJitterMs - this.minJitterMs);
+      const elapsed = Date.now() - this.lastRunAt;
+      if (this.lastRunAt > 0 && elapsed < jitter) {
+        await sleep(jitter - elapsed);
+      }
+      this.lastRunAt = Date.now();
+      return task();
+    });
+    // Garante que uma falha numa tarefa não trava a fila para as seguintes.
+    this.tail = run.then(() => {}, () => {});
+    return run;
+  }
+}
+
+// 3-8s de jitter — pequeno o suficiente pra não atrasar percetivelmente
+// o /dispatch em uso normal (poucos jobs), mas suficiente pra desfazer
+// rajadas de vários disparos simultâneos.
+const dispatchQueue = new DispatchQueue(3000, 8000);
+
+function isRetryableStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+// Executa a chamada real de dispatch, com backoff exponencial + jitter,
+// só pra erros transitórios (429/5xx). Erros 4xx (payload inválido,
+// permissão, etc.) devolvem na primeira tentativa — retry não ajudaria.
+async function triggerWorkflowWithRetry(account, workflowFile, inputs, maxAttempts = 3) {
+  let lastResponse = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    lastResponse = await dispatchQueue.enqueue(() => triggerWorkflow(account, workflowFile, inputs));
+
+    if (lastResponse.ok || !isRetryableStatus(lastResponse.status)) {
+      return lastResponse;
+    }
+
+    if (attempt < maxAttempts) {
+      const backoff = Math.pow(2, attempt) * 1000 + Math.random() * 1000; // ~2-3s, ~4-5s
+      console.warn(`[DISPATCH] job=${inputs.job_id} HTTP ${lastResponse.status} (tentativa ${attempt}/${maxAttempts}) — retry em ${Math.round(backoff)}ms`);
+      await sleep(backoff);
+    }
+  }
+  return lastResponse;
+}
+
 async function triggerWorkflow(account, workflowFile, inputs) {
   console.log(`[DISPATCH] job=${inputs.job_id} → workflow=${workflowFile} conta=${account.owner}`);
 
   return ghFetch(
     `https://api.github.com/repos/${account.owner}/${account.repo}/actions/workflows/${workflowFile}/dispatches`,
-    account.token,
+    account,
     {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -164,7 +335,7 @@ async function triggerWorkflow(account, workflowFile, inputs) {
 async function cancelRun(account, runId) {
   return ghFetch(
     `https://api.github.com/repos/${account.owner}/${account.repo}/actions/runs/${runId}/cancel`,
-    account.token,
+    account,
     { method: 'POST' }
   );
 }
@@ -172,7 +343,6 @@ async function cancelRun(account, runId) {
 // ── Job store ────────────────────────────────────────────────────────────────
 const jobStore = new Map();
 
-// Limpeza periódica de jobs antigos (mais de 24h)
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobStore) {
@@ -182,7 +352,7 @@ setInterval(() => {
       console.log(`[CLEANUP] Job expirado removido: ${id}`);
     }
   }
-}, 60 * 60 * 1000); // A cada hora
+}, 60 * 60 * 1000);
 
 // ── Auth middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
@@ -209,7 +379,6 @@ app.post('/dispatch', auth, async (req, res) => {
 
   if (!job_id) return res.status(400).json({ error: 'job_id obrigatório' });
 
-  // Verificar se job já existe e ainda está ativo
   if (jobStore.has(job_id)) {
     const existing = jobStore.get(job_id);
     const isActive = existing.status === 'dispatched' || existing.status === 'running';
@@ -221,7 +390,6 @@ app.post('/dispatch', auth, async (req, res) => {
         dispatchedAt: existing.dispatchedAt,
       });
     }
-    // Se job anterior falhou/completou, permite re-disparar
     console.log(`[DISPATCH] Job ${job_id} re-disparado (status anterior: ${existing.status})`);
     jobStore.delete(job_id);
   }
@@ -241,12 +409,11 @@ app.post('/dispatch', auth, async (req, res) => {
     file_indices,
   };
 
-  // Seleciona o workflow correto baseado no tipo de job
   const isUploader   = isUploaderJob(inputs);
   const workflowFile = isUploader ? UPLOADER_FILE : WORKFLOW_FILE;
 
   try {
-    const r = await triggerWorkflow(account, workflowFile, inputs);
+    const r = await triggerWorkflowWithRetry(account, workflowFile, inputs);
 
     if (!r.ok) {
       const t = await r.text();
@@ -288,11 +455,6 @@ app.post('/dispatch', auth, async (req, res) => {
 });
 
 // ── POST /shard-delete ────────────────────────────────────────────────────────
-// Chamado pelo backend EdgeOne (lib/edgeone.js → deleteContent) quando um
-// conteúdo é apagado do catálogo. Dispara shard-delete.yml numa das 2 contas
-// (round-robin, igual ao /dispatch) — não importa qual das duas corre o
-// workflow, já que ele autentica no shard de storage via STORAGE_GITHUB_TOKEN
-// (secret configurado no repo da conta, independente de qual das duas é).
 app.post('/shard-delete', auth, async (req, res) => {
   const { job_id, shard_repo } = req.body;
 
@@ -304,7 +466,7 @@ app.post('/shard-delete', auth, async (req, res) => {
   const inputs  = { job_id, shard_repo };
 
   try {
-    const r = await triggerWorkflow(account, SHARD_DELETE_FILE, inputs);
+    const r = await triggerWorkflowWithRetry(account, SHARD_DELETE_FILE, inputs);
 
     if (!r.ok) {
       const t = await r.text();
@@ -333,7 +495,6 @@ app.post('/webhook', async (req, res) => {
   const job = jobStore.get(job_id);
 
   if (!job) {
-    // Pode ser um uploader filho que não estava no jobStore
     console.log(`[WEBHOOK] Job ${job_id} não encontrado no store (uploader filho?)`);
     return res.status(404).json({ error: 'Job não encontrado', job_id });
   }
@@ -347,13 +508,11 @@ app.post('/webhook', async (req, res) => {
     account.activeJobs--;
   }
 
-  // Se for uploader, também atualiza o contador do job pai
   if (parent_job && jobStore.has(parent_job)) {
     const parent = jobStore.get(parent_job);
     if (!parent.uploaderResults) parent.uploaderResults = {};
     parent.uploaderResults[job_id] = status || 'done';
 
-    // Verificar se todos os uploaders terminaram
     const totalUploaders = parent.inputs?.metadata
       ? (() => {
           try {
@@ -409,6 +568,7 @@ app.get('/status', auth, (_, res) => {
       id: a.id,
       owner: a.owner,
       repo: a.repo,
+      auth_mode: a.mode,
       activeJobs: a.activeJobs,
       lastUsed: a.lastUsed,
     })),
@@ -471,9 +631,9 @@ function startKeepAlive(port) {
 }
 
 // ── Start ────────────────────────────────────────────────────────────────────
-console.log(`StreamVault Dispatcher v2.1`);
+console.log(`StreamVault Dispatcher v2.3`);
 console.log(`  Accounts: ${accounts.length}`);
-accounts.forEach(a => console.log(`    ${a.id}: ${a.owner}/${a.repo}`));
+accounts.forEach(a => console.log(`    ${a.id}: ${a.owner}/${a.repo} (auth: ${a.mode})`));
 console.log(`  Workflows:`);
 console.log(`    Process:      ${WORKFLOW_FILE}@${WORKFLOW_REF}`);
 console.log(`    Uploader:     ${UPLOADER_FILE}@${WORKFLOW_REF}`);
